@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Logs and session artefacts
+out.txt
+*.log
+a3000_worker.log
+
+# Stray extensionless files (typing accidents in shells)
+python/python
+python/SEND
+python/test
+
+# Test samples (audio binaries, regenerable)
+python/samples/
+
+# Manuals and external samples (copyrighted / derived files)
+docs/a3000_manual.txt
+docs/a3000_v2_manual.txt
+docs/A3000E.pdf
+docs/A3000V2E.pdf
+docs/spti_microsoft_sample.*
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/
+
+# C# build output (legacy src/)
+src/**/bin/
+src/**/obj/

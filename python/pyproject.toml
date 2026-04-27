@@ -1,0 +1,12 @@
+[project]
+name = "a3000-transfer"
+version = "0.1.0"
+description = "Python MVP for Yamaha A3000 SCSI/SPTI discovery and sample transfer experiments"
+requires-python = ">=3.11"
+
+[project.scripts]
+a3000-transfer = "a3000_transfer.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
