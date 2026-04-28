@@ -370,10 +370,20 @@ class A3000TransferApp:
         self.upload_uncheck_all_btn = ttk.Button(btns, text="☐ None",
                                                   command=lambda: self._set_all_checked(False))
         self.upload_uncheck_all_btn.pack(side="left", padx=(4, 0))
-        self.upload_send_btn = ttk.Button(btns, text="Upload", command=self._on_send_click)
+        self.upload_send_btn = tk.Button(
+            btns, text="Upload", command=self._on_send_click,
+            bg="#1976D2", fg="white",
+            activebackground="#1565C0", activeforeground="white",
+            disabledforeground="#BDBDBD",
+            font=("", 9, "bold"),
+            relief="raised", borderwidth=1, padx=14, pady=2,
+            cursor="hand2",
+        )
         self.upload_send_btn.pack(side="left", padx=(16, 0))
         self.upload_retry_btn = ttk.Button(btns, text="Retry errors", command=self._on_retry_click)
         self.upload_retry_btn.pack(side="left", padx=(8, 0))
+        self.upload_reset_btn = ttk.Button(btns, text="Reset state", command=self._on_reset_state_click)
+        self.upload_reset_btn.pack(side="left", padx=(8, 0))
         self.upload_clear_btn = ttk.Button(btns, text="Clear list", command=self._on_clear_click)
         self.upload_clear_btn.pack(side="left", padx=(8, 0))
 
@@ -513,17 +523,24 @@ class A3000TransferApp:
         dlg.grab_set()
         dlg.focus_set()
 
+    def _action_buttons(self) -> tuple:
+        return (
+            self.upload_add_btn, self.upload_preview_btn, self.upload_rename_btn,
+            self.upload_remove_btn, self.upload_check_all_btn, self.upload_uncheck_all_btn,
+            self.upload_send_btn, self.upload_retry_btn, self.upload_reset_btn,
+            self.upload_clear_btn,
+            self.download_scan_btn, self.download_btn,
+            self.download_retry_btn, self.download_clear_btn,
+        )
+
     def _set_busy(self, tab: str) -> None:
         self.current_tab = tab
-        # Désactive tous les boutons d'action
-        for b in (self.upload_add_btn, self.upload_send_btn, self.upload_retry_btn, self.upload_clear_btn,
-                  self.download_scan_btn, self.download_btn, self.download_retry_btn, self.download_clear_btn):
+        for b in self._action_buttons():
             b.configure(state="disabled")
         self.stop_btn.configure(state="normal")
 
     def _set_idle(self) -> None:
-        for b in (self.upload_add_btn, self.upload_send_btn, self.upload_retry_btn, self.upload_clear_btn,
-                  self.download_scan_btn, self.download_btn, self.download_retry_btn, self.download_clear_btn):
+        for b in self._action_buttons():
             b.configure(state="normal")
         self.stop_btn.configure(state="disabled")
 
@@ -865,6 +882,25 @@ class A3000TransferApp:
         except RuntimeError:
             pass
         self._playing_path = None
+
+    def _on_reset_state_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set("Operation in progress, wait before resetting.")
+            return
+        n = 0
+        for idx, it in enumerate(self.upload_items):
+            if it.state != "pending" or it.progress or it.sample_slot is not None:
+                it.state = "pending"
+                it.progress = 0.0
+                it.sent_bytes = 0
+                it.error_msg = ""
+                it.sample_slot = None
+                self._refresh_upload_row(idx)
+                n += 1
+        self.status_var.set(
+            f"Reset {n} item{'s' if n > 1 else ''} to pending."
+            if n else "Nothing to reset."
+        )
 
     def _on_retry_click(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
