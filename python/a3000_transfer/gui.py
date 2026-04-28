@@ -1,21 +1,29 @@
-"""GUI tkinter (non-admin) pour transférer des WAV vers le Yamaha A3000.
+"""GUI tkinter (non-admin) pour transférer des WAV vers/depuis le Yamaha A3000.
 
 Architecture split :
-- GUI tourne en non-admin → drag'n'drop fonctionne (Explorer non-admin → app non-admin)
-- Au premier transfert, la GUI lance via UAC un sub-process worker admin
-  (`python -m a3000_transfer._worker`) qui fait les commandes SCSI
-- Communication via socket TCP localhost (cross-privilege OK contrairement aux
-  pipes stdin/stdout qui sont bloquées par UIPI)
+- GUI tourne en non-admin → drag'n'drop fonctionne
+- Au premier transfert/download, la GUI lance via UAC un sub-process worker admin
+- Communication via socket TCP localhost
 - Le worker reste vivant tant que la GUI tourne → un seul UAC popup par session
+
+Layout :
+- Cadre Cible SCSI en haut (partagé entre onglets)
+- Notebook : onglet Upload + onglet Download
+- Bouton Interrompre + Status bar en bas
 """
 from __future__ import annotations
 
 import json
+import os
 import queue
+import shutil
 import socket
 import sys
+import tarfile
+import tempfile
 import threading
 import tkinter as tk
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -30,7 +38,7 @@ from .wav_reader import WaveValidationError, load_wave
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker client — gère le subprocess admin et la socket TCP localhost
+# Worker client
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WorkerError(Exception):
@@ -38,19 +46,17 @@ class WorkerError(Exception):
 
 
 class WorkerClient:
-    """Lance un worker admin via UAC et communique via socket TCP."""
+    """Lance un worker admin via UAC et communique via socket TCP localhost."""
 
     def __init__(self) -> None:
         self.server_sock: socket.socket | None = None
         self.client_sock: socket.socket | None = None
-        self.client_fp = None  # file-like
+        self.client_fp = None
         self.port: int = 0
-        self.worker_handle = None  # HANDLE du process pour TerminateProcess
+        self.worker_handle = None
         self._lock = threading.Lock()
 
     def start(self, timeout: float = 30.0) -> None:
-        """Bind un port libre, lance le worker via UAC, attend sa connexion."""
-        # Bind un port libre sur localhost
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("127.0.0.1", 0))
@@ -58,33 +64,28 @@ class WorkerClient:
         self.port = srv.getsockname()[1]
         self.server_sock = srv
 
-        # Lancer le worker via UAC (popup utilisateur)
         self._launch_worker_elevated(self.port)
 
-        # Attendre la connexion
         srv.settimeout(timeout)
         try:
-            conn, _addr = srv.accept()
+            conn, _ = srv.accept()
         except socket.timeout as exc:
             raise WorkerError(
-                "Le worker admin ne s'est pas connecté dans le délai imparti.\n"
-                "L'invite UAC a peut-être été refusée."
+                "The admin worker did not connect in time.\n"
+                "The UAC prompt may have been denied."
             ) from exc
 
         conn.settimeout(None)
         self.client_sock = conn
         self.client_fp = conn.makefile("rwb", buffering=0)
 
-        # Premier event = "ready"
-        first = self._recv_event(blocking=True)
+        first = self._recv_event()
         if first is None or first.get("event") != "ready":
-            raise WorkerError(f"Worker n'a pas envoyé 'ready' : {first}")
+            raise WorkerError(f"Worker did not send 'ready': {first}")
 
     def _launch_worker_elevated(self, port: int) -> None:
-        """ShellExecuteExW avec verb 'runas' (popup UAC) ; on récupère le HANDLE
-        du process pour pouvoir le TerminateProcess plus tard."""
         if sys.platform != "win32":
-            raise WorkerError("Cette architecture nécessite Windows (UAC).")
+            raise WorkerError("This architecture requires Windows (UAC).")
         import ctypes
         from ctypes import wintypes
 
@@ -124,14 +125,13 @@ class WorkerClient:
         if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
             err = ctypes.get_last_error()
             raise WorkerError(
-                f"ShellExecuteExW a échoué (LastError={err}). "
-                "L'élévation UAC a peut-être été refusée."
+                f"ShellExecuteExW failed (LastError={err}). "
+                "The UAC prompt may have been denied."
             )
 
         self.worker_handle = info.hProcess
 
     def terminate_worker(self) -> None:
-        """Tue le worker process via TerminateProcess. À utiliser pour interrompre."""
         if self.worker_handle is None:
             return
         try:
@@ -145,12 +145,11 @@ class WorkerClient:
     def send_command(self, cmd: dict) -> None:
         with self._lock:
             if self.client_fp is None:
-                raise WorkerError("Worker non connecté.")
-            line = json.dumps(cmd).encode("utf-8") + b"\n"
-            self.client_fp.write(line)
+                raise WorkerError("Worker not connected.")
+            self.client_fp.write(json.dumps(cmd).encode("utf-8") + b"\n")
             self.client_fp.flush()
 
-    def _recv_event(self, blocking: bool = True) -> dict | None:
+    def _recv_event(self) -> dict | None:
         if self.client_fp is None:
             return None
         line = self.client_fp.readline()
@@ -162,8 +161,7 @@ class WorkerClient:
             return {"event": "error", "msg": f"bad JSON from worker: {line!r}"}
 
     def recv_event(self) -> dict | None:
-        """Lit un event en bloquant. Retourne None si fermé."""
-        return self._recv_event(blocking=True)
+        return self._recv_event()
 
     def stop(self) -> None:
         try:
@@ -180,7 +178,6 @@ class WorkerClient:
         self.client_sock = None
         self.server_sock = None
         self.client_fp = None
-        # Cleanup HANDLE process si on l'a encore
         if self.worker_handle is not None:
             try:
                 import ctypes
@@ -191,24 +188,48 @@ class WorkerClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI state
+# Data classes
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class QueueItem:
+class UploadItem:
     path: Path
-    state: str = "pending"        # pending / running / done / error
-    progress: float = 0.0         # 0..1
+    state: str = "pending"          # pending / running / done / error / cancelled
+    progress: float = 0.0
     sent_bytes: int = 0
     total_bytes: int = 0
     sample_slot: int | None = None
+    error_msg: str = ""
+    file_size: int = 0              # raw file size in bytes
+    duration_s: float = 0.0
+    fmt_str: str = ""               # cached format string for display
+    checked: bool = True             # included in upload batch
+    sample_name: str = ""           # name on the A3000, max 16 chars
+
+
+@dataclass
+class DownloadItem:
+    slot: int
+    name: str
+    channels: int
+    bits: int
+    sample_rate: int
+    frames: int
+    duration: float
+    state: str = "available"        # available / pending / running / done / error / cancelled
+    progress: float = 0.0
+    sent_bytes: int = 0
+    total_bytes: int = 0
+    output_path: str = ""
     error_msg: str = ""
 
 
 @dataclass
 class UiEvent:
-    """Événement posté par le worker thread vers le main thread tkinter."""
-    kind: str                     # 'start' / 'progress' / 'done' / 'error' / 'allfinished' / 'status'
+    """Événement worker thread → main thread tkinter."""
+    kind: str                       # 'start' / 'progress' / 'done' / 'error' / 'cancelled' /
+                                    # 'allfinished' / 'status' / 'samples_listed'
+    tab: str = "upload"             # 'upload' / 'download'
     item_index: int = -1
     sample_slot: int | None = None
     sent: int = 0
@@ -217,21 +238,27 @@ class UiEvent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Application
+# App
 # ─────────────────────────────────────────────────────────────────────────────
 
 class A3000TransferApp:
     def __init__(self, root) -> None:
         self.root = root
         root.title("A3000 Sample Transfer")
-        root.geometry("750x520")
+        root.geometry("960x600")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self.items: list[QueueItem] = []
+        # State
+        self.upload_items: list[UploadItem] = []
+        self.download_items: list[DownloadItem] = []
         self.ui_queue: queue.Queue[UiEvent] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
         self.worker_client: WorkerClient | None = None
-        self.interrupted = False  # set par _on_stop_click pour différencier annulation vs erreur
+        self.interrupted = False
+        self.current_tab = "upload"  # tab actif pour l'op en cours
+        self._temp_dirs: list[Path] = []  # extracted archive dirs, cleaned on close
+        self._playing_path: Path | None = None
+        self._pending_toggle = None  # after-id for deferred checkbox toggle
 
         self._build_ui()
         self.root.after(100, self._drain_ui_events)
@@ -239,82 +266,297 @@ class A3000TransferApp:
     # ── UI building ──────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
-        # Cible SCSI
-        cfg = ttk.LabelFrame(self.root, text="Cible SCSI", padding=8)
-        cfg.pack(fill="x", padx=10, pady=(10, 5))
+        # Variables SCSI initialisées depuis la config persistée
+        saved = self._load_config()
+        self.ha_var = tk.IntVar(value=int(saved.get("ha", 1)))
+        self.bus_var = tk.IntVar(value=int(saved.get("bus", 0)))
+        self.target_var = tk.IntVar(value=int(saved.get("target", 0)))
+        self.lun_var = tk.IntVar(value=int(saved.get("lun", 0)))
 
-        self.ha_var = tk.IntVar(value=1)
-        self.bus_var = tk.IntVar(value=0)
-        self.target_var = tk.IntVar(value=0)
-        self.lun_var = tk.IntVar(value=0)
-        self.start_slot_var = tk.StringVar(value="auto")
+        # Notebook
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(10, 5))
 
-        for i, (label, var, w) in enumerate([
-            ("HA", self.ha_var, 4),
-            ("Bus", self.bus_var, 4),
-            ("Target", self.target_var, 4),
-            ("LUN", self.lun_var, 4),
-            ("Slot début", self.start_slot_var, 8),
-        ]):
-            ttk.Label(cfg, text=label).grid(row=0, column=i * 2, padx=(0 if i == 0 else 8, 2))
-            ttk.Entry(cfg, textvariable=var, width=w).grid(row=0, column=i * 2 + 1)
+        upload_tab = ttk.Frame(self.notebook, padding=8)
+        download_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(upload_tab, text="Upload (PC → A3000)")
+        self.notebook.add(download_tab, text="Download (A3000 → PC)")
 
-        # Liste / drop
-        drop_frame = ttk.LabelFrame(self.root, text="Fichiers à transférer", padding=8)
-        drop_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        self._build_upload_tab(upload_tab)
+        self._build_download_tab(download_tab)
 
-        cols = ("file", "format", "slot", "state", "progress")
-        self.tree = ttk.Treeview(drop_frame, columns=cols, show="headings", height=10)
+        # Bottom bar : Interrompre + Status
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", padx=10, pady=(5, 10))
+        self.stop_btn = ttk.Button(bottom, text="Stop",
+                                   command=self._on_stop_click, state="disabled")
+        self.stop_btn.pack(side="left")
+        ttk.Button(bottom, text="Settings…",
+                   command=self._open_settings_dialog).pack(side="right")
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(bottom, textvariable=self.status_var, anchor="w").pack(
+            side="left", fill="x", expand=True, padx=(8, 8)
+        )
+
+    def _build_upload_tab(self, tab) -> None:
+        # Slot début : switch Auto / Manual + entry
+        opts = ttk.Frame(tab)
+        opts.pack(fill="x", pady=(0, 5))
+        ttk.Label(opts, text="Start slot:").pack(side="left")
+        self.auto_slot_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opts, text="Auto (first free)",
+                        variable=self.auto_slot_var,
+                        command=self._update_slot_entry_state).pack(side="left", padx=(8, 0))
+        self.manual_slot_var = tk.StringVar(value="1")
+        self.manual_slot_entry = ttk.Entry(opts, textvariable=self.manual_slot_var, width=8)
+        self.manual_slot_entry.pack(side="left", padx=(8, 0))
+        self._update_slot_entry_state()
+
+        # Liste / drop zone
+        list_frame = ttk.LabelFrame(tab, text="Files to upload", padding=6)
+        list_frame.pack(fill="both", expand=True)
+
+        cols = ("checked", "file", "name", "format", "size", "duration", "slot", "state", "progress")
+        self.upload_tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                                         height=10, selectmode="extended")
         for col, label, w, anchor in [
-            ("file", "Fichier", 220, "w"),
-            ("format", "Format", 130, "w"),
-            ("slot", "Slot", 60, "center"),
-            ("state", "État", 80, "center"),
-            ("progress", "Progression", 200, "w"),
+            ("checked", "✓", 30, "center"),
+            ("file", "File", 180, "w"),
+            ("name", "Sample name", 130, "w"),
+            ("format", "Format", 120, "w"),
+            ("size", "Size", 65, "e"),
+            ("duration", "Duration", 65, "e"),
+            ("slot", "Slot", 45, "center"),
+            ("state", "State", 65, "center"),
+            ("progress", "Progress", 140, "w"),
         ]:
-            self.tree.heading(col, text=label)
-            self.tree.column(col, width=w, anchor=anchor)
-        self.tree.pack(fill="both", expand=True)
+            self.upload_tree.heading(col, text=label)
+            self.upload_tree.column(col, width=w, anchor=anchor, stretch=False)
+        self.upload_tree.pack(fill="both", expand=True)
+        self.upload_tree.bind("<Delete>", lambda _e: self._on_remove_click())
+        self.upload_tree.bind("<Double-1>", self._on_tree_double_click)
+        self.upload_tree.bind("<Button-1>", self._on_tree_click, add="+")
+        self.upload_tree.bind("<F2>", lambda _e: self._on_rename_click())
+        self.upload_tree.bind("<Return>", lambda _e: self._on_preview_click())
+        self.upload_tree.heading("checked", command=self._on_toggle_all_click)
 
-        # Drop & Ctrl+V
         if HAS_DND:
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind("<<Drop>>", self._on_drop)
         self.root.bind("<Control-v>", self._on_paste)
         self.root.bind("<Control-V>", self._on_paste)
 
-        hint = "Glissez des WAV ici"
+        hint = ("Drag WAV files or archives (.zip / .tar.gz) here  •  Ctrl+V  •  or \"Add…\"\n"
+                "8/16/24-bit supported (auto-converted to 16-bit with TPDF dither)")
         if not HAS_DND:
-            hint = "Utilisez « Ajouter fichiers… » (drag'n'drop indispo)"
-        else:
-            hint += "  •  Ctrl+V pour coller depuis l'Explorer  •  ou « Ajouter fichiers… »"
-        self.hint_label = ttk.Label(drop_frame, text=hint, foreground="gray")
-        self.hint_label.place(relx=0.5, rely=0.5, anchor="center")
+            hint = "Use \"Add files…\" (drag'n'drop unavailable)"
+        self.upload_hint = ttk.Label(list_frame, text=hint, foreground="gray", justify="center")
+        self.upload_hint.place(relx=0.5, rely=0.5, anchor="center")
 
         # Boutons
-        bf = ttk.Frame(self.root, padding=(10, 0))
-        bf.pack(fill="x", padx=10, pady=5)
-        self.add_btn = ttk.Button(bf, text="Ajouter fichiers…", command=self._on_add_click)
-        self.add_btn.pack(side="left")
-        self.send_btn = ttk.Button(bf, text="Transférer", command=self._on_send_click)
-        self.send_btn.pack(side="left", padx=(8, 0))
-        self.stop_btn = ttk.Button(bf, text="Interrompre", command=self._on_stop_click,
-                                   state="disabled")
-        self.stop_btn.pack(side="left", padx=(8, 0))
-        self.retry_btn = ttk.Button(bf, text="Retenter erreurs", command=self._on_retry_click)
-        self.retry_btn.pack(side="left", padx=(8, 0))
-        self.clear_btn = ttk.Button(bf, text="Effacer la liste", command=self._on_clear_click)
-        self.clear_btn.pack(side="left", padx=(8, 0))
-        self.download_btn = ttk.Button(bf, text="Télécharger sample…",
-                                       command=self._on_download_click)
-        self.download_btn.pack(side="right")
+        btns = ttk.Frame(tab)
+        btns.pack(fill="x", pady=(5, 0))
+        self.upload_add_btn = ttk.Button(btns, text="Add files…", command=self._on_add_click)
+        self.upload_add_btn.pack(side="left")
+        self.upload_preview_btn = ttk.Button(btns, text="▶ Preview", command=self._on_preview_click)
+        self.upload_preview_btn.pack(side="left", padx=(8, 0))
+        self.upload_rename_btn = ttk.Button(btns, text="Rename", command=self._on_rename_click)
+        self.upload_rename_btn.pack(side="left", padx=(8, 0))
+        self.upload_remove_btn = ttk.Button(btns, text="Remove", command=self._on_remove_click)
+        self.upload_remove_btn.pack(side="left", padx=(8, 0))
+        self.upload_check_all_btn = ttk.Button(btns, text="☑ All",
+                                                command=lambda: self._set_all_checked(True))
+        self.upload_check_all_btn.pack(side="left", padx=(16, 0))
+        self.upload_uncheck_all_btn = ttk.Button(btns, text="☐ None",
+                                                  command=lambda: self._set_all_checked(False))
+        self.upload_uncheck_all_btn.pack(side="left", padx=(4, 0))
+        self.upload_send_btn = ttk.Button(btns, text="Upload", command=self._on_send_click)
+        self.upload_send_btn.pack(side="left", padx=(16, 0))
+        self.upload_retry_btn = ttk.Button(btns, text="Retry errors", command=self._on_retry_click)
+        self.upload_retry_btn.pack(side="left", padx=(8, 0))
+        self.upload_clear_btn = ttk.Button(btns, text="Clear list", command=self._on_clear_click)
+        self.upload_clear_btn.pack(side="left", padx=(8, 0))
 
-        # Status
-        self.status_var = tk.StringVar(value="Prêt. Glissez des WAV pour commencer.")
-        ttk.Label(self.root, textvariable=self.status_var, relief="sunken",
-                  anchor="w", padding=4).pack(fill="x", side="bottom")
+        # Résumé total
+        self.upload_summary_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.upload_summary_var,
+                  foreground="gray").pack(fill="x", pady=(4, 0))
 
-    # ── Drop / paste / picker ────────────────────────────────────────────────
+    def _build_download_tab(self, tab) -> None:
+        # Liste des samples du sampler
+        list_frame = ttk.LabelFrame(tab, text="Samples on the sampler", padding=6)
+        list_frame.pack(fill="both", expand=True)
+
+        cols = ("slot", "name", "format", "duration", "state", "progress")
+        self.download_tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                                          height=12, selectmode="extended")
+        for col, label, w, anchor in [
+            ("slot", "#", 50, "center"),
+            ("name", "Name", 180, "w"),
+            ("format", "Format", 140, "w"),
+            ("duration", "Duration", 80, "e"),
+            ("state", "State", 80, "center"),
+            ("progress", "Progress", 180, "w"),
+        ]:
+            self.download_tree.heading(col, text=label)
+            self.download_tree.column(col, width=w, anchor=anchor)
+        self.download_tree.pack(fill="both", expand=True)
+
+        self.download_hint = ttk.Label(
+            list_frame,
+            text="Click \"Scan\" to list the samples on the sampler.",
+            foreground="gray",
+        )
+        self.download_hint.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Boutons
+        btns = ttk.Frame(tab)
+        btns.pack(fill="x", pady=(5, 0))
+        self.download_scan_btn = ttk.Button(btns, text="Scan", command=self._on_scan_click)
+        self.download_scan_btn.pack(side="left")
+        self.download_btn = ttk.Button(btns, text="Download selection…",
+                                       command=self._on_download_selection_click)
+        self.download_btn.pack(side="left", padx=(8, 0))
+        self.download_retry_btn = ttk.Button(btns, text="Retry errors",
+                                             command=self._on_download_retry_click)
+        self.download_retry_btn.pack(side="left", padx=(8, 0))
+        self.download_clear_btn = ttk.Button(btns, text="Clear list",
+                                             command=self._on_download_clear_click)
+        self.download_clear_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Label(btns, text="Tip: Ctrl+click / Shift+click for multi-select.",
+                  foreground="gray").pack(side="right")
+
+    # ── Common helpers ───────────────────────────────────────────────────────
+
+    def _common_scsi(self) -> dict:
+        return {
+            "ha": int(self.ha_var.get()),
+            "bus": int(self.bus_var.get()),
+            "target": int(self.target_var.get()),
+            "lun": int(self.lun_var.get()),
+        }
+
+    # ── Config persistance ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _config_path() -> Path:
+        if sys.platform == "win32":
+            base = Path(os.environ.get("APPDATA") or Path.home())
+        else:
+            base = Path.home() / ".config"
+        return base / "a3000_transfer" / "config.json"
+
+    def _load_config(self) -> dict:
+        try:
+            with open(self._config_path(), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_config(self, cfg: dict) -> None:
+        p = self._config_path()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except OSError:
+            pass
+
+    def _open_settings_dialog(self) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("SCSI Target")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+
+        tmp_ha = tk.IntVar(value=self.ha_var.get())
+        tmp_bus = tk.IntVar(value=self.bus_var.get())
+        tmp_target = tk.IntVar(value=self.target_var.get())
+        tmp_lun = tk.IntVar(value=self.lun_var.get())
+
+        for i, (label, var) in enumerate([
+            ("HA (Host Adapter)", tmp_ha),
+            ("Bus (PathId)", tmp_bus),
+            ("Target (SCSI ID)", tmp_target),
+            ("LUN", tmp_lun),
+        ]):
+            ttk.Label(frame, text=label).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Entry(frame, textvariable=var, width=8).grid(
+                row=i, column=1, padx=(12, 0), pady=2, sticky="w",
+            )
+
+        ttk.Label(
+            frame,
+            text='Run "a3000-transfer scan" in a terminal to find these values.',
+            foreground="gray",
+        ).grid(row=4, column=0, columnspan=2, pady=(10, 0))
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=5, column=0, columnspan=2, pady=(12, 0), sticky="e")
+
+        def _on_ok() -> None:
+            self.ha_var.set(int(tmp_ha.get()))
+            self.bus_var.set(int(tmp_bus.get()))
+            self.target_var.set(int(tmp_target.get()))
+            self.lun_var.set(int(tmp_lun.get()))
+            self._save_config(self._common_scsi())
+            dlg.destroy()
+
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="OK", command=_on_ok).pack(side="right")
+
+        dlg.bind("<Return>", lambda _e: _on_ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+        dlg.focus_set()
+
+    def _set_busy(self, tab: str) -> None:
+        self.current_tab = tab
+        # Désactive tous les boutons d'action
+        for b in (self.upload_add_btn, self.upload_send_btn, self.upload_retry_btn, self.upload_clear_btn,
+                  self.download_scan_btn, self.download_btn, self.download_retry_btn, self.download_clear_btn):
+            b.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+    def _set_idle(self) -> None:
+        for b in (self.upload_add_btn, self.upload_send_btn, self.upload_retry_btn, self.upload_clear_btn,
+                  self.download_scan_btn, self.download_btn, self.download_retry_btn, self.download_clear_btn):
+            b.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+
+    def _ensure_worker(self) -> WorkerClient | None:
+        if self.worker_client is not None:
+            try:
+                err = self.worker_client.client_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if err == 0:
+                    return self.worker_client
+            except Exception:
+                pass
+            try:
+                self.worker_client.stop()
+            except Exception:
+                pass
+            self.worker_client = None
+            self.ui_queue.put(UiEvent(kind="status", msg="Previous worker lost — relaunching UAC..."))
+
+        client = WorkerClient()
+        try:
+            client.start()
+        except WorkerError as exc:
+            self.ui_queue.put(UiEvent(kind="error", msg=str(exc)))
+            return None
+        self.worker_client = client
+        self.ui_queue.put(UiEvent(kind="status", msg="Admin worker connected."))
+        return client
+
+    def _update_slot_entry_state(self) -> None:
+        state = "disabled" if self.auto_slot_var.get() else "normal"
+        self.manual_slot_entry.configure(state=state)
+
+    # ── Upload tab handlers ──────────────────────────────────────────────────
 
     def _on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
@@ -328,331 +570,356 @@ class A3000TransferApp:
 
     def _on_add_click(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Ajouter des fichiers WAV",
-            filetypes=[("WAV PCM", "*.wav"), ("Tous les fichiers", "*.*")],
+            title="Add WAV files or archives",
+            filetypes=[
+                ("WAV or archives", "*.wav *.zip *.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2"),
+                ("WAV PCM", "*.wav"),
+                ("Archives", "*.zip *.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2"),
+                ("All files", "*.*"),
+            ],
         )
         self._add_paths(paths, source="picker")
 
+    @staticmethod
+    def _is_archive(path: Path) -> bool:
+        name = path.name.lower()
+        if name.endswith((".tar.gz", ".tar.bz2")):
+            return True
+        return path.suffix.lower() in {".zip", ".tar", ".tgz", ".tbz2"}
+
+    def _extract_archive(self, archive_path: Path) -> list[Path]:
+        size_mb = archive_path.stat().st_size / (1024 * 1024)
+        self.status_var.set(f"Extracting {archive_path.name} ({size_mb:.1f} MB)…")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            try:
+                temp_dir = Path(tempfile.mkdtemp(prefix="a3000_transfer_"))
+            except OSError as exc:
+                self.status_var.set(f"Cannot create temp dir: {exc}")
+                return []
+            self._temp_dirs.append(temp_dir)
+            try:
+                if archive_path.suffix.lower() == ".zip":
+                    with zipfile.ZipFile(archive_path) as z:
+                        z.extractall(temp_dir)
+                else:
+                    with tarfile.open(archive_path) as t:
+                        t.extractall(temp_dir, filter="data")
+            except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+                self.status_var.set(f"Failed to extract {archive_path.name}: {exc}")
+                return []
+            wavs = sorted(p for p in temp_dir.rglob("*")
+                          if p.is_file() and p.suffix.lower() == ".wav")
+            if not wavs:
+                self.status_var.set(f"No WAV files in {archive_path.name}.")
+            return wavs
+        finally:
+            self.root.config(cursor="")
+
     def _add_paths(self, paths, source: str) -> None:
-        added = 0
+        expanded: list[Path] = []
+        archives_extracted = 0
         for p in paths:
             path = Path(p)
-            if path.is_file() and path.suffix.lower() == ".wav":
-                self._add_item(path)
-                added += 1
-        if added:
-            self.hint_label.place_forget()
-            label = {"drop": "déposé", "paste": "collé", "picker": "ajouté"}[source]
-            s = "s" if added > 1 else ""
-            self.status_var.set(f"{added} fichier{s} {label}{s}.")
-        elif source == "paste":
-            self.status_var.set("Clipboard : aucun .wav.")
+            if not path.is_file():
+                continue
+            if path.suffix.lower() == ".wav":
+                expanded.append(path)
+            elif self._is_archive(path):
+                wavs = self._extract_archive(path)
+                if wavs:
+                    archives_extracted += 1
+                expanded.extend(wavs)
 
-    def _add_item(self, path: Path) -> None:
+        added = 0
+        for wp in expanded:
+            self._add_upload_item(wp)
+            added += 1
+
+        if added:
+            self.upload_hint.place_forget()
+            label = {"drop": "dropped", "paste": "pasted", "picker": "added"}[source]
+            s = "s" if added > 1 else ""
+            arc = f" ({archives_extracted} archive{'s' if archives_extracted > 1 else ''})" if archives_extracted else ""
+            self.status_var.set(f"{added} file{s} {label}{arc}.")
+        else:
+            n_paths = sum(1 for _ in paths)
+            if n_paths:
+                self.status_var.set(
+                    f"Ignored {n_paths} item(s): only WAV or .zip/.tar archives are accepted."
+                )
+            elif source == "paste":
+                self.status_var.set("Clipboard: no .wav or archive.")
+
+    def _add_upload_item(self, path: Path) -> None:
         try:
             wave = load_wave(path)
-            ch = "stéréo" if wave.channels == 2 else "mono"
-            fmt = f"{wave.sample_rate / 1000:.1f}k {ch} {wave.bits_per_sample}b"
+            ch = "stereo" if wave.channels == 2 else "mono"
+            fmt = f"{wave.sample_rate / 1000:.1f}k {ch} {wave.bits_per_sample}bits"
             total = wave.byte_count
+            duration = wave.frame_count / wave.sample_rate if wave.sample_rate else 0
         except WaveValidationError as exc:
-            fmt = f"<invalide: {exc}>"
+            fmt = f"<invalid: {exc}>"
             total = 0
-        item = QueueItem(path=path, total_bytes=total)
-        self.items.append(item)
-        self.tree.insert("", "end", iid=str(len(self.items) - 1),
-                         values=(path.name, fmt, "", item.state, ""))
+            duration = 0
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            file_size = 0
+        sample_name = path.stem[:16]
+        item = UploadItem(path=path, total_bytes=total, file_size=file_size,
+                          duration_s=duration, fmt_str=fmt, sample_name=sample_name)
+        self.upload_items.append(item)
+        idx = len(self.upload_items) - 1
+        self.upload_tree.insert("", "end", iid=f"u{idx}", values=("",) * 9)
+        self._refresh_upload_row(idx)
+        self._update_upload_summary()
 
-    def _on_download_click(self) -> None:
-        """Lance un scan du sampler puis ouvre un browser pour choisir le sample."""
+    def _on_clear_click(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
-            self.status_var.set("Opération en cours, attendre la fin.")
+            messagebox.showwarning("Operation in progress", "Cannot clear during a transfer.")
             return
-        config = {
-            "ha": self.ha_var.get(),
-            "bus": self.bus_var.get(),
-            "target": self.target_var.get(),
-            "lun": self.lun_var.get(),
-        }
-        self._set_buttons_busy()
-        self.status_var.set("Scan des samples en cours…")
-        self.worker_thread = threading.Thread(
-            target=self._browse_thread_run, args=(config,), daemon=True,
+        self._stop_preview()
+        self.upload_items.clear()
+        for child in self.upload_tree.get_children():
+            self.upload_tree.delete(child)
+        self.upload_hint.place(relx=0.5, rely=0.5, anchor="center")
+        self._update_upload_summary()
+        self.status_var.set("Upload list cleared.")
+
+    def _on_tree_click(self, event):
+        col = self.upload_tree.identify_column(event.x)
+        iid = self.upload_tree.identify_row(event.y)
+        if col != "#1" or not iid or not iid.startswith("u"):
+            return None
+        # Capture la sélection AVANT que Tk ne la réduise. Si la ligne
+        # cliquée fait partie d'une multi-sélection, on toggle tout le groupe.
+        sel = self.upload_tree.selection()
+        if iid in sel and len(sel) > 1:
+            indices = tuple(int(i[1:]) for i in sel if i.startswith("u"))
+        else:
+            indices = (int(iid[1:]),)
+        if self._pending_toggle is not None:
+            self.root.after_cancel(self._pending_toggle)
+        self._pending_toggle = self.root.after(
+            250, lambda ix=indices: self._do_toggle_multi(ix)
         )
-        self.worker_thread.start()
+        return "break"  # empêche Tk de réduire la sélection à la seule ligne cliquée
 
-    def _set_buttons_busy(self) -> None:
-        self.send_btn.configure(state="disabled")
-        self.add_btn.configure(state="disabled")
-        self.clear_btn.configure(state="disabled")
-        self.retry_btn.configure(state="disabled")
-        self.download_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
+    def _do_toggle_multi(self, indices) -> None:
+        self._pending_toggle = None
+        valid = [i for i in indices if 0 <= i < len(self.upload_items)]
+        if not valid:
+            return
+        new_state = not self.upload_items[valid[0]].checked
+        for idx in valid:
+            self.upload_items[idx].checked = new_state
+            self._refresh_upload_row(idx)
+        self._update_upload_summary()
 
-    def _browse_thread_run(self, config: dict) -> None:
-        """Scan le sampler via le worker, puis pousse les résultats à l'UI."""
-        self.interrupted = False
-        client = self._ensure_worker()
-        if client is None:
-            self.ui_queue.put(UiEvent(kind="allfinished"))
+    def _on_tree_double_click(self, event) -> None:
+        if self._pending_toggle is not None:
+            self.root.after_cancel(self._pending_toggle)
+            self._pending_toggle = None
+        col = self.upload_tree.identify_column(event.x)
+        iid = self.upload_tree.identify_row(event.y)
+        if not iid or not iid.startswith("u"):
             return
-        common = {
-            "ha": int(config["ha"]),
-            "bus": int(config["bus"]),
-            "target": int(config["target"]),
-            "lun": int(config["lun"]),
-        }
-        try:
-            client.send_command({
-                "cmd": "list_samples",
-                "start": 0,
-                "limit": 128,
-                **common,
-            })
-            samples = None
-            while samples is None:
-                ev = client.recv_event()
-                if ev is None:
-                    if self.interrupted:
-                        self.ui_queue.put(UiEvent(kind="status", msg="Scan annulé."))
-                    else:
-                        self.ui_queue.put(UiEvent(kind="error",
-                                                  msg="Worker s'est déconnecté pendant le scan."))
-                    self.worker_client = None
-                    self.ui_queue.put(UiEvent(kind="allfinished"))
-                    return
-                e = ev.get("event")
-                if e == "scan_progress":
-                    self.ui_queue.put(UiEvent(
-                        kind="status",
-                        msg=f"Scan : {ev['scanned']} slots, {ev['found']} samples trouvés…",
-                    ))
-                elif e == "samples_list":
-                    samples = ev["samples"]
-                elif e == "error":
-                    self.ui_queue.put(UiEvent(kind="error", msg=ev.get("msg", "?")))
-                    self.ui_queue.put(UiEvent(kind="allfinished"))
-                    return
-        except Exception as exc:
-            if not self.interrupted:
-                self.ui_queue.put(UiEvent(kind="error", msg=f"Communication worker: {exc}"))
-            self.ui_queue.put(UiEvent(kind="allfinished"))
+        if col == "#1":
+            sel = self.upload_tree.selection()
+            if iid in sel and len(sel) > 1:
+                indices = tuple(int(i[1:]) for i in sel if i.startswith("u"))
+            else:
+                indices = (int(iid[1:]),)
+            self._do_toggle_multi(indices)
             return
+        if col == "#3":
+            self._on_rename_click()
+            return
+        self._on_preview_click()
 
-        # On a la liste — l'envoyer à l'UI thread pour ouvrir le dialog
-        self.ui_queue.put(UiEvent(kind="open_browser", msg=json.dumps({
-            "samples": samples,
-            "config": config,
-        })))
-        self.ui_queue.put(UiEvent(kind="allfinished"))
+    def _on_toggle_all_click(self) -> None:
+        if not self.upload_items:
+            return
+        all_checked = all(it.checked for it in self.upload_items)
+        self._set_all_checked(not all_checked)
 
-    def _open_sample_browser(self, samples: list, config: dict) -> None:
-        """Ouvert depuis _handle_ui_event (main thread tkinter)."""
-        if not samples:
-            messagebox.showinfo("Aucun sample", "Aucun sample détecté dans le sampler.")
+    def _set_all_checked(self, value: bool) -> None:
+        for idx, it in enumerate(self.upload_items):
+            it.checked = value
+            self._refresh_upload_row(idx)
+        self._update_upload_summary()
+
+    def _update_upload_summary(self) -> None:
+        n_total = len(self.upload_items)
+        if n_total == 0:
+            self.upload_summary_var.set("")
             return
-        dlg = SampleBrowserDialog(self.root, samples)
-        self.root.wait_window(dlg.top)
-        if dlg.result is None:
-            return
-        slot_num, output_path = dlg.result
-        download_config = {**config, "sample_number": slot_num, "output_path": output_path}
-        self._set_buttons_busy()
-        self.status_var.set(f"Téléchargement sample #{slot_num} → {Path(output_path).name}…")
-        self.worker_thread = threading.Thread(
-            target=self._download_thread_run, args=(download_config,), daemon=True,
+        checked = [it for it in self.upload_items if it.checked]
+        total_bytes = sum(it.file_size for it in checked)
+        total_dur = sum(it.duration_s for it in checked)
+        size_str = self._format_size(total_bytes) if total_bytes else "0 B"
+        dur_str = self._format_duration(total_dur) if total_dur else "0s"
+        self.upload_summary_var.set(
+            f"{len(checked)} / {n_total} files checked  •  {size_str}  •  {dur_str}"
         )
-        self.worker_thread.start()
 
-    def _download_thread_run(self, config: dict) -> None:
-        self.interrupted = False
-        client = self._ensure_worker()
-        if client is None:
-            self.ui_queue.put(UiEvent(kind="allfinished"))
+    def _on_rename_click(self) -> None:
+        sel = self.upload_tree.selection()
+        if not sel:
+            self.status_var.set("Select a row to rename.")
             return
-        common = {
-            "ha": int(config["ha"]),
-            "bus": int(config["bus"]),
-            "target": int(config["target"]),
-            "lun": int(config["lun"]),
-        }
+        iid = sel[0]
+        if not iid.startswith("u"):
+            return
+        idx = int(iid[1:])
+        item = self.upload_items[idx]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Rename sample")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Sample name (max 16 chars):").pack(anchor="w")
+        var = tk.StringVar(value=item.sample_name)
+        entry = ttk.Entry(frame, textvariable=var, width=20)
+        entry.pack(fill="x", pady=(4, 8))
+        entry.icursor("end")
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        def _on_ok() -> None:
+            new = var.get().strip()[:16]
+            if new:
+                item.sample_name = new
+                self._refresh_upload_row(idx)
+            dlg.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="OK", command=_on_ok).pack(side="right")
+        dlg.bind("<Return>", lambda _e: _on_ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.grab_set()
+
+    def _on_remove_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set("Cannot remove during a transfer.")
+            return
+        sel = self.upload_tree.selection()
+        indices = sorted({int(iid[1:]) for iid in sel if iid.startswith("u")},
+                         reverse=True)
+        if not indices:
+            self.status_var.set("Select one or more rows to remove.")
+            return
+        for idx in indices:
+            removed = self.upload_items.pop(idx)
+            if self._playing_path == removed.path:
+                self._stop_preview()
+        for child in self.upload_tree.get_children():
+            self.upload_tree.delete(child)
+        for i in range(len(self.upload_items)):
+            self.upload_tree.insert("", "end", iid=f"u{i}", values=("",) * 9)
+            self._refresh_upload_row(i)
+        if not self.upload_items:
+            self.upload_hint.place(relx=0.5, rely=0.5, anchor="center")
+        self._update_upload_summary()
+        n = len(indices)
+        self.status_var.set(f"Removed {n} item{'s' if n > 1 else ''}.")
+
+    def _on_preview_click(self) -> None:
+        if sys.platform != "win32":
+            self.status_var.set("Preview only available on Windows.")
+            return
+        sel = self.upload_tree.selection()
+        idx = None
+        if sel:
+            iid = sel[0]
+            if iid.startswith("u"):
+                idx = int(iid[1:])
+        if idx is None:
+            self.status_var.set("Select a row to preview.")
+            return
+        item = self.upload_items[idx]
+        if self._playing_path == item.path:
+            self._stop_preview()
+            return
         try:
-            client.send_command({
-                "cmd": "receive",
-                "sample_number": config["sample_number"],
-                "output_path": config["output_path"],
-                **common,
-            })
-            while True:
-                ev = client.recv_event()
-                if ev is None:
-                    if self.interrupted:
-                        self.ui_queue.put(UiEvent(kind="status", msg="Téléchargement annulé."))
-                    else:
-                        self.ui_queue.put(UiEvent(
-                            kind="error",
-                            msg="Worker s'est déconnecté pendant le téléchargement.",
-                        ))
-                    self.worker_client = None
-                    break
-                e = ev.get("event")
-                if e == "progress":
-                    sent = int(ev["sent"])
-                    total = int(ev["total"])
-                    pct = (sent / total * 100) if total else 0
-                    self.ui_queue.put(UiEvent(
-                        kind="status",
-                        msg=f"Téléchargement : {sent}/{total} ({pct:.1f}%)",
-                    ))
-                elif e == "received":
-                    self.ui_queue.put(UiEvent(
-                        kind="status",
-                        msg=f"Téléchargé : {ev['name']!r} → {ev['output_path']} "
-                            f"({ev['channels']}ch {ev['sample_rate']}Hz {ev['frames']} frames)",
-                    ))
-                    break
-                elif e == "error":
-                    self.ui_queue.put(UiEvent(kind="error", msg=ev.get("msg", "?")))
-                    break
-        except Exception as exc:
-            if not self.interrupted:
-                self.ui_queue.put(UiEvent(kind="error", msg=f"Communication worker: {exc}"))
-        self.ui_queue.put(UiEvent(kind="allfinished"))
+            import winsound
+            winsound.PlaySound(str(item.path),
+                               winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self._playing_path = item.path
+            self.status_var.set(f"Playing: {item.path.name}")
+        except RuntimeError as exc:
+            self.status_var.set(f"Preview failed: {exc}")
 
-    def _on_stop_click(self) -> None:
-        """Tue le worker process. Le sample en cours sera marqué annulé.
-        Les pending suivants restent intouchés et pourront être relancés."""
-        if not (self.worker_thread and self.worker_thread.is_alive()):
+    def _stop_preview(self) -> None:
+        if sys.platform != "win32" or self._playing_path is None:
             return
-        self.interrupted = True
-        if self.worker_client is not None:
-            try:
-                self.worker_client.terminate_worker()
-            except Exception:
-                pass
-            try:
-                self.worker_client.stop()
-            except Exception:
-                pass
-            self.worker_client = None
-        self.status_var.set("Interruption demandée — worker tué.")
-        # Le worker_thread va voir la socket morte et finir tout seul, ce qui
-        # postera l'event 'allfinished' et réactivera les boutons.
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except RuntimeError:
+            pass
+        self._playing_path = None
 
     def _on_retry_click(self) -> None:
-        """Reset les items en erreur ou annulés vers pending pour qu'ils soient
-        retraités au prochain Transfer."""
         if self.worker_thread and self.worker_thread.is_alive():
-            self.status_var.set("Transfert en cours, attendre la fin avant de retenter.")
+            self.status_var.set("Operation in progress, wait before retrying.")
             return
         retried = 0
-        for idx, it in enumerate(self.items):
+        for idx, it in enumerate(self.upload_items):
             if it.state in ("error", "cancelled"):
                 it.state = "pending"
                 it.progress = 0
                 it.sent_bytes = 0
                 it.error_msg = ""
-                self._refresh_row(idx)
+                self._refresh_upload_row(idx)
                 retried += 1
-        if retried:
-            s = "s" if retried > 1 else ""
-            self.status_var.set(f"{retried} item{s} prêt{s} à retenter.")
-        else:
-            self.status_var.set("Rien à retenter.")
-
-    def _on_clear_click(self) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            messagebox.showwarning("Transfert en cours", "Impossible d'effacer pendant un transfert.")
-            return
-        self.items.clear()
-        for child in self.tree.get_children():
-            self.tree.delete(child)
-        self.hint_label.place(relx=0.5, rely=0.5, anchor="center")
-        self.status_var.set("Liste effacée.")
-
-    # ── Transfert ────────────────────────────────────────────────────────────
+        self.status_var.set(
+            f"{retried} item{'s' if retried > 1 else ''} ready to retry."
+            if retried else "Nothing to retry."
+        )
 
     def _on_send_click(self) -> None:
-        if not self.items:
-            self.status_var.set("Rien à transférer.")
+        if not self.upload_items:
+            self.status_var.set("Nothing to upload.")
             return
         if self.worker_thread and self.worker_thread.is_alive():
-            self.status_var.set("Transfert déjà en cours.")
+            self.status_var.set("Operation already running.")
             return
-        pending_count = sum(1 for it in self.items if it.state == "pending")
-        if pending_count == 0:
-            self.status_var.set(
-                "Tous les fichiers sont déjà traités. Effacez la liste pour recommencer."
-            )
+        if not any(it.state == "pending" and it.checked for it in self.upload_items):
+            self.status_var.set("No checked file pending. Check items or retry errors.")
             return
-
-        config = {
-            "ha": self.ha_var.get(),
-            "bus": self.bus_var.get(),
-            "target": self.target_var.get(),
-            "lun": self.lun_var.get(),
-            "start_slot": self.start_slot_var.get().strip(),
-        }
-
-        self.send_btn.configure(state="disabled")
-        self.clear_btn.configure(state="disabled")
-        self.add_btn.configure(state="disabled")
-        self.retry_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self.status_var.set("Démarrage du worker admin (popup UAC)…")
+        start_slot = "auto" if self.auto_slot_var.get() else self.manual_slot_var.get().strip()
+        config = {**self._common_scsi(), "start_slot": start_slot}
+        self._set_busy("upload")
+        self.status_var.set("Starting admin worker (UAC prompt on first launch)…")
         self.worker_thread = threading.Thread(
-            target=self._send_thread_run, args=(config,), daemon=True,
+            target=self._upload_thread_run, args=(config,), daemon=True,
         )
         self.worker_thread.start()
 
-    def _ensure_worker(self) -> WorkerClient | None:
-        """Garantit qu'un worker vivant est dispo. Re-lance si nécessaire."""
-        if self.worker_client is not None:
-            # Tester si la connexion est encore vivante via un check non-bloquant
-            try:
-                # Ping inoffensif : send une commande qui est toujours valide
-                # (find_free_slot avec start très haut → reviendra vite)
-                # Plus simple : vérifier via getsockopt SO_ERROR
-                err = self.worker_client.client_sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-                if err == 0:
-                    return self.worker_client
-            except Exception:
-                pass
-            # Worker mort, on le clean
-            try:
-                self.worker_client.stop()
-            except Exception:
-                pass
-            self.worker_client = None
-            self.ui_queue.put(UiEvent(kind="status", msg="Worker précédent perdu — relance avec UAC..."))
-
-        client = WorkerClient()
-        try:
-            client.start()
-        except WorkerError as exc:
-            self.ui_queue.put(UiEvent(kind="error", msg=str(exc)))
-            return None
-        self.worker_client = client
-        self.ui_queue.put(UiEvent(kind="status", msg="Worker admin connecté."))
-        return client
-
-    def _send_thread_run(self, config: dict) -> None:
-        self.interrupted = False  # reset à chaque session
+    def _upload_thread_run(self, config: dict) -> None:
+        self.interrupted = False
         client = self._ensure_worker()
         if client is None:
             self.ui_queue.put(UiEvent(kind="allfinished"))
             return
-        common = {
-            "ha": int(config["ha"]),
-            "bus": int(config["bus"]),
-            "target": int(config["target"]),
-            "lun": int(config["lun"]),
-        }
+        common = {k: int(v) if k != "start_slot" else v for k, v in config.items()}
 
         # Slot de départ
         start_slot_str = config["start_slot"].lower()
         if start_slot_str in ("auto", ""):
             try:
-                client.send_command({"cmd": "find_free_slot", **common})
+                client.send_command({
+                    "cmd": "find_free_slot",
+                    "ha": int(config["ha"]), "bus": int(config["bus"]),
+                    "target": int(config["target"]), "lun": int(config["lun"]),
+                })
                 ev = client.recv_event()
             except Exception as exc:
                 self.ui_queue.put(UiEvent(kind="error", msg=f"find_free_slot: {exc}"))
@@ -667,21 +934,243 @@ class A3000TransferApp:
             try:
                 next_slot = int(start_slot_str)
             except ValueError:
-                self.ui_queue.put(UiEvent(kind="error", msg=f"Slot début invalide: {start_slot_str!r}"))
+                self.ui_queue.put(UiEvent(kind="error", msg=f"Invalid start slot: {start_slot_str!r}"))
                 self.ui_queue.put(UiEvent(kind="allfinished"))
                 return
 
-        # Boucle transferts : seulement les "pending"
-        for idx, item in enumerate(self.items):
-            if item.state != "pending":
+        for idx, item in enumerate(self.upload_items):
+            if item.state != "pending" or not item.checked:
                 continue
-            self.ui_queue.put(UiEvent(kind="start", item_index=idx, sample_slot=next_slot))
+            self.ui_queue.put(UiEvent(kind="start", tab="upload",
+                                      item_index=idx, sample_slot=next_slot))
             try:
                 client.send_command({
                     "cmd": "transfer",
                     "wave_path": str(item.path),
                     "sample_number": next_slot,
-                    "name": item.path.stem[:16],
+                    "name": (item.sample_name or item.path.stem)[:16],
+                    "ha": int(config["ha"]), "bus": int(config["bus"]),
+                    "target": int(config["target"]), "lun": int(config["lun"]),
+                })
+                done = False
+                while not done:
+                    ev = client.recv_event()
+                    if ev is None:
+                        if self.interrupted:
+                            self.ui_queue.put(UiEvent(kind="cancelled", tab="upload",
+                                                      item_index=idx, msg="Cancelled"))
+                        else:
+                            self.ui_queue.put(UiEvent(kind="error", tab="upload",
+                                                      item_index=idx,
+                                                      msg="Worker disconnected."))
+                        self.worker_client = None
+                        self.ui_queue.put(UiEvent(kind="allfinished"))
+                        return
+                    e = ev.get("event")
+                    if e == "progress":
+                        self.ui_queue.put(UiEvent(kind="progress", tab="upload",
+                                                  item_index=idx,
+                                                  sent=int(ev["sent"]), total=int(ev["total"])))
+                    elif e == "done":
+                        self.ui_queue.put(UiEvent(kind="done", tab="upload",
+                                                  item_index=idx,
+                                                  sample_slot=int(ev["sample_number"])))
+                        done = True
+                    elif e == "error":
+                        self.ui_queue.put(UiEvent(kind="error", tab="upload",
+                                                  item_index=idx, msg=ev.get("msg", "?")))
+                        done = True
+            except Exception as exc:
+                if self.interrupted:
+                    self.ui_queue.put(UiEvent(kind="cancelled", tab="upload",
+                                              item_index=idx, msg="Cancelled"))
+                    self.ui_queue.put(UiEvent(kind="allfinished"))
+                    return
+                self.ui_queue.put(UiEvent(kind="error", tab="upload",
+                                          item_index=idx,
+                                          msg=f"Worker communication: {exc}"))
+                continue
+            next_slot += 1
+
+        self.ui_queue.put(UiEvent(kind="allfinished"))
+
+    # ── Download tab handlers ────────────────────────────────────────────────
+
+    def _on_scan_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set("Operation already running.")
+            return
+        config = self._common_scsi()
+        self._set_busy("download")
+        self.status_var.set("Scanning samples…")
+        self.worker_thread = threading.Thread(
+            target=self._scan_thread_run, args=(config,), daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _scan_thread_run(self, config: dict) -> None:
+        self.interrupted = False
+        client = self._ensure_worker()
+        if client is None:
+            self.ui_queue.put(UiEvent(kind="allfinished"))
+            return
+        try:
+            client.send_command({"cmd": "list_samples", "start": 0, "limit": 128, **config})
+            samples = None
+            while samples is None:
+                ev = client.recv_event()
+                if ev is None:
+                    if not self.interrupted:
+                        self.ui_queue.put(UiEvent(kind="error", msg="Worker disconnected during scan."))
+                    self.worker_client = None
+                    self.ui_queue.put(UiEvent(kind="allfinished"))
+                    return
+                e = ev.get("event")
+                if e == "scan_progress":
+                    self.ui_queue.put(UiEvent(kind="status",
+                                              msg=f"Scan: {ev['scanned']} slots, {ev['found']} samples found…"))
+                elif e == "samples_list":
+                    samples = ev["samples"]
+                elif e == "error":
+                    self.ui_queue.put(UiEvent(kind="error", msg=ev.get("msg", "?")))
+                    self.ui_queue.put(UiEvent(kind="allfinished"))
+                    return
+        except Exception as exc:
+            if not self.interrupted:
+                self.ui_queue.put(UiEvent(kind="error", msg=f"Worker communication: {exc}"))
+            self.ui_queue.put(UiEvent(kind="allfinished"))
+            return
+
+        self.ui_queue.put(UiEvent(kind="samples_listed", msg=json.dumps(samples)))
+        self.ui_queue.put(UiEvent(kind="allfinished"))
+
+    def _populate_download_list(self, samples: list) -> None:
+        self.download_items.clear()
+        for child in self.download_tree.get_children():
+            self.download_tree.delete(child)
+        for s in samples:
+            it = DownloadItem(
+                slot=int(s["slot"]),
+                name=s["name"],
+                channels=int(s["channels"]),
+                bits=int(s["bits"]),
+                sample_rate=int(s["sample_rate"]),
+                frames=int(s["frames"]),
+                duration=float(s.get("duration") or 0),
+            )
+            self.download_items.append(it)
+            self._insert_download_row(len(self.download_items) - 1)
+        if self.download_items:
+            self.download_hint.place_forget()
+            self.status_var.set(f"{len(self.download_items)} samples found.")
+        else:
+            self.download_hint.place(relx=0.5, rely=0.5, anchor="center")
+            self.status_var.set("No samples found.")
+
+    def _insert_download_row(self, idx: int) -> None:
+        it = self.download_items[idx]
+        ch = "stereo" if it.channels == 2 else "mono"
+        sr = f"{it.sample_rate / 1000:.1f}k" if it.sample_rate else "?"
+        fmt = f"{sr} {ch} {it.bits}bits"
+        duration = f"{it.duration:.2f}s" if it.duration else "—"
+        self.download_tree.insert("", "end", iid=f"d{idx}",
+                                  values=(it.slot, it.name, fmt, duration, it.state, ""))
+
+    def _on_download_clear_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("Operation in progress", "Cannot clear during a transfer.")
+            return
+        self.download_items.clear()
+        for child in self.download_tree.get_children():
+            self.download_tree.delete(child)
+        self.download_hint.place(relx=0.5, rely=0.5, anchor="center")
+        self.status_var.set("Sample list cleared.")
+
+    def _on_download_retry_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set("Operation in progress, wait before retrying.")
+            return
+        retried = 0
+        for idx, it in enumerate(self.download_items):
+            if it.state in ("error", "cancelled"):
+                it.state = "pending"
+                it.progress = 0
+                it.sent_bytes = 0
+                it.error_msg = ""
+                self._refresh_download_row(idx)
+                retried += 1
+        self.status_var.set(
+            f"{retried} item{'s' if retried > 1 else ''} ready to retry."
+            if retried else "Nothing to retry."
+        )
+
+    def _on_download_selection_click(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.status_var.set("Operation in progress, wait for it to finish.")
+            return
+        # Récupère les indices sélectionnés OU ceux en pending (retry)
+        sel = self.download_tree.selection()
+        sel_indices = [int(iid[1:]) for iid in sel if iid.startswith("d")]
+        pending_indices = [i for i, it in enumerate(self.download_items) if it.state == "pending"]
+
+        # Logique : si on a sélectionné, on prend la sélection. Sinon on prend les pending.
+        if sel_indices:
+            indices = sel_indices
+        elif pending_indices:
+            indices = pending_indices
+        else:
+            self.status_var.set("Select one or more samples (Ctrl+click).")
+            return
+
+        # Demande le dossier de destination
+        out_dir = filedialog.askdirectory(title="Destination folder",
+                                          mustexist=True)
+        if not out_dir:
+            return
+        out_dir_path = Path(out_dir)
+
+        # Préparer chaque item : compute output_path, set state pending
+        for idx in indices:
+            it = self.download_items[idx]
+            safe_name = "".join(ch if ch.isalnum() or ch in " ._-" else "_"
+                                for ch in (it.name or f"sample_{it.slot:03d}")).strip()
+            if not safe_name:
+                safe_name = f"sample_{it.slot:03d}"
+            it.output_path = str(out_dir_path / f"{safe_name}.wav")
+            it.state = "pending"
+            it.progress = 0
+            it.sent_bytes = 0
+            it.error_msg = ""
+            self._refresh_download_row(idx)
+
+        config = {**self._common_scsi(), "indices": indices}
+        self._set_busy("download")
+        self.status_var.set(f"Downloading {len(indices)} sample(s)…")
+        self.worker_thread = threading.Thread(
+            target=self._download_thread_run, args=(config,), daemon=True,
+        )
+        self.worker_thread.start()
+
+    def _download_thread_run(self, config: dict) -> None:
+        self.interrupted = False
+        client = self._ensure_worker()
+        if client is None:
+            self.ui_queue.put(UiEvent(kind="allfinished"))
+            return
+        common = {"ha": int(config["ha"]), "bus": int(config["bus"]),
+                  "target": int(config["target"]), "lun": int(config["lun"])}
+
+        for idx in config["indices"]:
+            item = self.download_items[idx]
+            if item.state != "pending":
+                continue
+            self.ui_queue.put(UiEvent(kind="start", tab="download",
+                                      item_index=idx, sample_slot=item.slot))
+            try:
+                client.send_command({
+                    "cmd": "receive",
+                    "sample_number": item.slot,
+                    "output_path": item.output_path,
                     **common,
                 })
                 done = False
@@ -689,54 +1178,59 @@ class A3000TransferApp:
                     ev = client.recv_event()
                     if ev is None:
                         if self.interrupted:
-                            self.ui_queue.put(UiEvent(
-                                kind="cancelled", item_index=idx,
-                                msg="Annulé",
-                            ))
+                            self.ui_queue.put(UiEvent(kind="cancelled", tab="download",
+                                                      item_index=idx, msg="Cancelled"))
                         else:
-                            self.ui_queue.put(UiEvent(
-                                kind="error", item_index=idx,
-                                msg="Worker s'est déconnecté.",
-                            ))
+                            self.ui_queue.put(UiEvent(kind="error", tab="download",
+                                                      item_index=idx,
+                                                      msg="Worker disconnected."))
                         self.worker_client = None
                         self.ui_queue.put(UiEvent(kind="allfinished"))
                         return
                     e = ev.get("event")
                     if e == "progress":
-                        self.ui_queue.put(UiEvent(
-                            kind="progress", item_index=idx,
-                            sent=int(ev["sent"]), total=int(ev["total"]),
-                        ))
-                    elif e == "done":
-                        self.ui_queue.put(UiEvent(
-                            kind="done", item_index=idx,
-                            sample_slot=int(ev["sample_number"]),
-                        ))
+                        self.ui_queue.put(UiEvent(kind="progress", tab="download",
+                                                  item_index=idx,
+                                                  sent=int(ev["sent"]), total=int(ev["total"])))
+                    elif e == "received":
+                        self.ui_queue.put(UiEvent(kind="done", tab="download", item_index=idx))
                         done = True
                     elif e == "error":
-                        self.ui_queue.put(UiEvent(
-                            kind="error", item_index=idx, msg=ev.get("msg", "?"),
-                        ))
+                        self.ui_queue.put(UiEvent(kind="error", tab="download",
+                                                  item_index=idx, msg=ev.get("msg", "?")))
                         done = True
-                    else:
-                        # event inconnu, ignore
-                        pass
             except Exception as exc:
                 if self.interrupted:
-                    self.ui_queue.put(UiEvent(
-                        kind="cancelled", item_index=idx, msg="Annulé",
-                    ))
+                    self.ui_queue.put(UiEvent(kind="cancelled", tab="download",
+                                              item_index=idx, msg="Cancelled"))
                     self.ui_queue.put(UiEvent(kind="allfinished"))
                     return
-                self.ui_queue.put(UiEvent(
-                    kind="error", item_index=idx, msg=f"Communication worker: {exc}",
-                ))
+                self.ui_queue.put(UiEvent(kind="error", tab="download",
+                                          item_index=idx,
+                                          msg=f"Worker communication: {exc}"))
                 continue
-            next_slot += 1
 
         self.ui_queue.put(UiEvent(kind="allfinished"))
 
-    # ── Pump UI events ───────────────────────────────────────────────────────
+    # ── Stop ─────────────────────────────────────────────────────────────────
+
+    def _on_stop_click(self) -> None:
+        if not (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        self.interrupted = True
+        if self.worker_client is not None:
+            try:
+                self.worker_client.terminate_worker()
+            except Exception:
+                pass
+            try:
+                self.worker_client.stop()
+            except Exception:
+                pass
+            self.worker_client = None
+        self.status_var.set("Stop requested — worker killed.")
+
+    # ── UI events pump ───────────────────────────────────────────────────────
 
     def _drain_ui_events(self) -> None:
         try:
@@ -751,179 +1245,150 @@ class A3000TransferApp:
         if ev.kind == "status":
             self.status_var.set(ev.msg)
             return
+        if ev.kind == "samples_listed":
+            samples = json.loads(ev.msg)
+            self._populate_download_list(samples)
+            return
+        if ev.kind == "allfinished":
+            self._set_idle()
+            if self.current_tab == "upload":
+                done_n = sum(1 for it in self.upload_items if it.state == "done")
+                err_n = sum(1 for it in self.upload_items if it.state == "error")
+                self.status_var.set(f"Finished. {done_n} uploaded, "
+                                    f"{err_n} error{'s' if err_n > 1 else ''}.")
+            elif self.current_tab == "download":
+                done_n = sum(1 for it in self.download_items if it.state == "done")
+                err_n = sum(1 for it in self.download_items if it.state == "error")
+                if done_n + err_n > 0:
+                    self.status_var.set(f"Finished. {done_n} downloaded, "
+                                        f"{err_n} error{'s' if err_n > 1 else ''}.")
+            return
+        if ev.kind == "error" and ev.item_index < 0:
+            self.status_var.set(f"Error: {ev.msg}")
+            messagebox.showerror("Error", ev.msg)
+            return
+
+        # Events liés à un item spécifique d'un onglet
+        if ev.tab == "upload":
+            self._handle_upload_event(ev)
+        else:
+            self._handle_download_event(ev)
+
+    def _handle_upload_event(self, ev: UiEvent) -> None:
+        if ev.item_index < 0 or ev.item_index >= len(self.upload_items):
+            return
+        it = self.upload_items[ev.item_index]
         if ev.kind == "start":
-            it = self.items[ev.item_index]
             it.state = "running"
             it.sample_slot = ev.sample_slot
-            self._refresh_row(ev.item_index)
-            self.status_var.set(f"Transfert : {it.path.name} → slot #{ev.sample_slot}")
-            return
-        if ev.kind == "progress":
-            it = self.items[ev.item_index]
+            self.status_var.set(f"Uploading: {it.path.name} → slot #{ev.sample_slot}")
+        elif ev.kind == "progress":
             it.sent_bytes = ev.sent
             it.total_bytes = ev.total
             it.progress = ev.sent / ev.total if ev.total else 0
-            self._refresh_row(ev.item_index)
-            return
-        if ev.kind == "done":
-            it = self.items[ev.item_index]
+        elif ev.kind == "done":
             it.state = "done"
             it.progress = 1.0
-            self._refresh_row(ev.item_index)
-            return
-        if ev.kind == "error":
-            if ev.item_index >= 0:
-                it = self.items[ev.item_index]
-                it.state = "error"
-                it.error_msg = ev.msg
-                self._refresh_row(ev.item_index)
-                self.status_var.set(f"Erreur : {it.path.name} — {ev.msg}")
-            else:
-                self.status_var.set(f"Erreur : {ev.msg}")
-                messagebox.showerror("Erreur", ev.msg)
-            return
-        if ev.kind == "open_browser":
-            data = json.loads(ev.msg)
-            self._open_sample_browser(data["samples"], data["config"])
-            return
-        if ev.kind == "cancelled":
-            it = self.items[ev.item_index]
+        elif ev.kind == "error":
+            it.state = "error"
+            it.error_msg = ev.msg
+            self.status_var.set(f"Error: {it.path.name} — {ev.msg}")
+        elif ev.kind == "cancelled":
             it.state = "cancelled"
-            it.error_msg = ev.msg or "Annulé"
-            self._refresh_row(ev.item_index)
-            return
-        if ev.kind == "allfinished":
-            self.send_btn.configure(state="normal")
-            self.clear_btn.configure(state="normal")
-            self.add_btn.configure(state="normal")
-            self.retry_btn.configure(state="normal")
-            self.download_btn.configure(state="normal")
-            self.stop_btn.configure(state="disabled")
-            done_n = sum(1 for it in self.items if it.state == "done")
-            err_n = sum(1 for it in self.items if it.state == "error")
-            self.status_var.set(f"Terminé. {done_n} OK, {err_n} erreur{'s' if err_n > 1 else ''}.")
-            return
+            it.error_msg = ev.msg or "Cancelled"
+        self._refresh_upload_row(ev.item_index)
 
-    def _refresh_row(self, idx: int) -> None:
-        item = self.items[idx]
-        slot_str = f"#{item.sample_slot}" if item.sample_slot is not None else ""
-        if item.state == "running":
-            pct = int(item.progress * 100)
-            progress_str = f"{pct:3d}%  {item.sent_bytes}/{item.total_bytes}"
-        elif item.state == "done":
-            progress_str = "OK"
-        elif item.state == "error":
-            progress_str = item.error_msg[:40]
-        elif item.state == "cancelled":
-            progress_str = "Annulé"
-        else:
-            progress_str = ""
-        existing = self.tree.item(str(idx), "values")
-        fmt = existing[1] if existing else ""
-        self.tree.item(str(idx), values=(item.path.name, fmt, slot_str, item.state, progress_str))
+    def _handle_download_event(self, ev: UiEvent) -> None:
+        if ev.item_index < 0 or ev.item_index >= len(self.download_items):
+            return
+        it = self.download_items[ev.item_index]
+        if ev.kind == "start":
+            it.state = "running"
+            self.status_var.set(f"Downloading: sample #{it.slot} '{it.name}'")
+        elif ev.kind == "progress":
+            it.sent_bytes = ev.sent
+            it.total_bytes = ev.total
+            it.progress = ev.sent / ev.total if ev.total else 0
+        elif ev.kind == "done":
+            it.state = "done"
+            it.progress = 1.0
+        elif ev.kind == "error":
+            it.state = "error"
+            it.error_msg = ev.msg
+            self.status_var.set(f"Error: sample #{it.slot} — {ev.msg}")
+        elif ev.kind == "cancelled":
+            it.state = "cancelled"
+            it.error_msg = ev.msg or "Cancelled"
+        self._refresh_download_row(ev.item_index)
 
-    def _refresh_all(self) -> None:
-        for idx in range(len(self.items)):
-            self._refresh_row(idx)
+    def _refresh_upload_row(self, idx: int) -> None:
+        it = self.upload_items[idx]
+        slot_str = f"#{it.sample_slot}" if it.sample_slot is not None else ""
+        progress_str = self._progress_text(it.state, it.progress, it.sent_bytes,
+                                           it.total_bytes, it.error_msg)
+        size_str = self._format_size(it.file_size)
+        duration_str = self._format_duration(it.duration_s)
+        check_str = "☑" if it.checked else "☐"
+        self.upload_tree.item(f"u{idx}", values=(
+            check_str, it.path.name, it.sample_name, it.fmt_str,
+            size_str, duration_str, slot_str, it.state, progress_str,
+        ))
+
+    @staticmethod
+    def _format_size(bytes_: int) -> str:
+        if bytes_ <= 0:
+            return ""
+        if bytes_ < 1024:
+            return f"{bytes_} B"
+        if bytes_ < 1024 * 1024:
+            return f"{bytes_ / 1024:.1f} KB"
+        return f"{bytes_ / (1024 * 1024):.1f} MB"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds <= 0:
+            return ""
+        if seconds < 60:
+            return f"{seconds:.2f}s"
+        m, s = divmod(int(seconds), 60)
+        return f"{m}:{s:02d}"
+
+    def _refresh_download_row(self, idx: int) -> None:
+        it = self.download_items[idx]
+        ch = "stereo" if it.channels == 2 else "mono"
+        sr = f"{it.sample_rate / 1000:.1f}k" if it.sample_rate else "?"
+        fmt = f"{sr} {ch} {it.bits}bits"
+        duration = f"{it.duration:.2f}s" if it.duration else "—"
+        progress_str = self._progress_text(it.state, it.progress, it.sent_bytes,
+                                           it.total_bytes, it.error_msg)
+        self.download_tree.item(f"d{idx}",
+                                values=(it.slot, it.name, fmt, duration, it.state, progress_str))
+
+    @staticmethod
+    def _progress_text(state: str, progress: float, sent: int, total: int, error_msg: str) -> str:
+        if state == "running":
+            pct = int(progress * 100)
+            return f"{pct:3d}%  {sent}/{total}"
+        if state == "done":
+            return "OK"
+        if state == "error":
+            return error_msg[:40]
+        if state == "cancelled":
+            return "Cancelled"
+        return ""
 
     # ── Cleanup ──────────────────────────────────────────────────────────────
 
     def _on_close(self) -> None:
+        self._stop_preview()
         if self.worker_client is not None:
             try:
                 self.worker_client.stop()
             except Exception:
                 pass
+        for d in self._temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
         self.root.destroy()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dialog modal : télécharger un sample
-# ─────────────────────────────────────────────────────────────────────────────
-
-class SampleBrowserDialog:
-    """Liste les samples du sampler, l'utilisateur choisit lequel télécharger."""
-
-    def __init__(self, parent, samples: list) -> None:
-        self.samples = samples
-        self.result: tuple[int, str] | None = None
-        self.top = tk.Toplevel(parent)
-        self.top.title(f"Samples du sampler ({len(samples)})")
-        self.top.transient(parent)
-        self.top.grab_set()
-        self.top.geometry("680x420")
-
-        frm = ttk.Frame(self.top, padding=10)
-        frm.pack(fill="both", expand=True)
-
-        ttk.Label(frm, text=f"{len(samples)} samples détectés. Sélectionnez-en un puis cliquez Télécharger.",
-                  foreground="gray").pack(anchor="w", pady=(0, 6))
-
-        cols = ("slot", "name", "format", "duration", "frames")
-        self.tree = ttk.Treeview(frm, columns=cols, show="headings", height=14, selectmode="browse")
-        for col, label, w, anchor in [
-            ("slot", "#", 50, "center"),
-            ("name", "Nom", 200, "w"),
-            ("format", "Format", 160, "w"),
-            ("duration", "Durée", 80, "e"),
-            ("frames", "Frames", 100, "e"),
-        ]:
-            self.tree.heading(col, text=label)
-            self.tree.column(col, width=w, anchor=anchor)
-        self.tree.pack(fill="both", expand=True)
-
-        for s in samples:
-            ch = "stéréo" if s["channels"] == 2 else "mono"
-            sr = s["sample_rate"]
-            sr_str = f"{sr / 1000:.1f}k" if sr else "?"
-            fmt = f"{sr_str} {ch} {s['bits']}b"
-            duration = f"{s['duration']:.2f}s" if s.get("duration") else "—"
-            self.tree.insert("", "end", iid=str(s["slot"]),
-                             values=(s["slot"], s["name"], fmt, duration, s["frames"]))
-
-        # Sélectionner la première ligne par défaut
-        if samples:
-            self.tree.selection_set(str(samples[0]["slot"]))
-            self.tree.focus(str(samples[0]["slot"]))
-
-        # Double-clic = télécharger directement
-        self.tree.bind("<Double-1>", lambda e: self._ok())
-
-        btn_frm = ttk.Frame(frm)
-        btn_frm.pack(fill="x", pady=(8, 0))
-        ttk.Button(btn_frm, text="Annuler", command=self._cancel).pack(side="right", padx=(8, 0))
-        ttk.Button(btn_frm, text="Télécharger…", command=self._ok).pack(side="right")
-
-        self.top.bind("<Return>", lambda e: self._ok())
-        self.top.bind("<Escape>", lambda e: self._cancel())
-
-    def _ok(self) -> None:
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showinfo("Sélection", "Choisis un sample dans la liste.", parent=self.top)
-            return
-        slot = int(sel[0])
-        sample = next((s for s in self.samples if s["slot"] == slot), None)
-        if sample is None:
-            return
-        # Save dialog avec nom auto-généré depuis le name du sample
-        safe_name = "".join(ch if ch.isalnum() or ch in " ._-" else "_" for ch in (sample["name"] or "sample")).strip()
-        if not safe_name:
-            safe_name = f"sample_{slot:03d}"
-        path = filedialog.asksaveasfilename(
-            parent=self.top,
-            defaultextension=".wav",
-            filetypes=[("WAV PCM", "*.wav")],
-            initialfile=f"{safe_name}.wav",
-        )
-        if not path:
-            return
-        self.result = (slot, path)
-        self.top.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        self.top.destroy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -931,7 +1396,6 @@ class SampleBrowserDialog:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_clipboard_filelist_win32() -> list[str]:
-    """Lit la liste de fichiers (CF_HDROP) du clipboard Windows."""
     if sys.platform != "win32":
         return []
     import ctypes
@@ -946,7 +1410,8 @@ def _read_clipboard_filelist_win32() -> list[str]:
     user32.CloseClipboard.restype = wintypes.BOOL
     user32.GetClipboardData.argtypes = [wintypes.UINT]
     user32.GetClipboardData.restype = wintypes.HANDLE
-    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT,
+                                       wintypes.LPWSTR, wintypes.UINT]
     shell32.DragQueryFileW.restype = wintypes.UINT
 
     paths: list[str] = []
