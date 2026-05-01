@@ -116,7 +116,11 @@ class WorkerClient:
         info.fMask = SEE_MASK_NOCLOSEPROCESS
         info.lpVerb = "runas"
         info.lpFile = sys.executable
-        info.lpParameters = f'-m a3000_transfer._worker --port {port}'
+        if getattr(sys, "frozen", False):
+            # PyInstaller : le .exe se relance avec --worker
+            info.lpParameters = f'--worker --port {port}'
+        else:
+            info.lpParameters = f'-m a3000_transfer._worker --port {port}'
         info.nShow = SW_HIDE
 
         ctypes.windll.shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFO)]
