@@ -245,7 +245,7 @@ class A3000TransferApp:
     def __init__(self, root) -> None:
         self.root = root
         root.title("A3000 Sample Transfer")
-        root.geometry("960x600")
+        root.geometry("1100x720")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # State
@@ -279,11 +279,14 @@ class A3000TransferApp:
 
         upload_tab = ttk.Frame(self.notebook, padding=8)
         download_tab = ttk.Frame(self.notebook, padding=8)
+        slicer_tab = ttk.Frame(self.notebook)
         self.notebook.add(upload_tab, text="Upload (PC → A3000)")
         self.notebook.add(download_tab, text="Download (A3000 → PC)")
+        self.notebook.add(slicer_tab, text="Slicer (cut WAV → slices)")
 
         self._build_upload_tab(upload_tab)
         self._build_download_tab(download_tab)
+        self._build_slicer_tab(slicer_tab)
 
         # Bottom bar : Interrompre + Status
         bottom = ttk.Frame(self.root)
@@ -436,6 +439,31 @@ class A3000TransferApp:
 
         ttk.Label(btns, text="Tip: Ctrl+click / Shift+click for multi-select.",
                   foreground="gray").pack(side="right")
+
+    # ── Slicer tab ───────────────────────────────────────────────────────────
+
+    def _build_slicer_tab(self, tab) -> None:
+        from .slicer import SlicerView
+        self.slicer_view = SlicerView(
+            tab,
+            on_send_to_upload=self._on_slicer_send_to_upload,
+        )
+        self.slicer_view.pack(fill="both", expand=True)
+
+    def _on_slicer_send_to_upload(self, slice_paths: list[Path]) -> None:
+        if not slice_paths:
+            return
+        # Le dossier temp commun (mkdtemp côté slicer) est nettoyé à la fermeture
+        self._temp_dirs.append(slice_paths[0].parent)
+        added = 0
+        for p in slice_paths:
+            if p.exists() and p.suffix.lower() == ".wav":
+                self._add_upload_item(p)
+                added += 1
+        if added:
+            self.upload_hint.place_forget()
+            self.notebook.select(0)  # bascule sur l'onglet Upload
+            self.status_var.set(f"{added} slice(s) added to Upload list.")
 
     # ── Common helpers ───────────────────────────────────────────────────────
 

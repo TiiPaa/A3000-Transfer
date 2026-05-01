@@ -1,8 +1,18 @@
 [project]
 name = "a3000-transfer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python MVP for Yamaha A3000 SCSI/SPTI discovery and sample transfer experiments"
 requires-python = ">=3.11"
+dependencies = [
+    "tkinterdnd2",
+    "numpy",
+    "librosa",
+    "soundfile",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+audio = ["sounddevice"]
 
 [project.scripts]
 a3000-transfer = "a3000_transfer.cli:main"
