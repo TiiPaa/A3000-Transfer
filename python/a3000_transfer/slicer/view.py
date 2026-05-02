@@ -111,6 +111,12 @@ class SlicerView(ttk.Frame):
         ttk.Button(top, text="Export to folder…", command=self.export_slices).pack(
             side=tk.RIGHT, padx=(0, 8),
         )
+        ttk.Button(top, text="Deselect all", command=self._deselect_all).pack(
+            side=tk.RIGHT, padx=(0, 8),
+        )
+        ttk.Button(top, text="Select all", command=self._select_all).pack(
+            side=tk.RIGHT, padx=(0, 4),
+        )
 
         controls = ttk.LabelFrame(self, text="Detection", padding=8)
         controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=4)
@@ -224,25 +230,14 @@ class SlicerView(ttk.Frame):
     # ── Drag'n'drop ──────────────────────────────────────────────────────────
 
     def _register_drop_target(self):
-        if not DND_AVAILABLE:
-            return
-        widget = self.canvas.get_tk_widget()
-        try:
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind("<<Drop>>", self._on_drop)
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", self._on_drop)
-        except tk.TclError:
-            pass
+        # Pas de drop target propre à la SlicerView : on utilise celui du root
+        # (registered par gui.py) qui route selon l'onglet actif. Évite le
+        # cold-load OLE 20-30s sur le premier drop dans le slicer canvas.
+        pass
 
-    def _on_drop(self, event):
-        try:
-            paths = self.tk.splitlist(event.data)
-        except tk.TclError:
-            return
-        if not paths:
-            return
-        self._load_path(paths[0])
+    def handle_dropped_path(self, path):
+        """Appelé par gui.py quand un drop arrive sur l'onglet Slicer."""
+        self._load_path(path)
 
     # ── Manipulation des onsets ──────────────────────────────────────────────
 
@@ -390,6 +385,24 @@ class SlicerView(ttk.Frame):
     def _clear_selection(self):
         self._selected_midpoints.clear()
         self._render_selection_cells()
+
+    def _select_all(self):
+        if self.y_mono is None or len(self.onsets) == 0:
+            return
+        self._selected_midpoints.clear()
+        for i in range(len(self.onsets)):
+            start = int(self.onsets[i])
+            end = int(self.onsets[i + 1]) if i + 1 < len(self.onsets) else len(self.y_mono)
+            self._selected_midpoints.add((start + end) // 2)
+        self._render_selection_cells()
+        self.status.config(text=f"All {len(self.onsets)} slices selected")
+
+    def _deselect_all(self):
+        if not self._selected_midpoints:
+            return
+        self._selected_midpoints.clear()
+        self._render_selection_cells()
+        self.status.config(text="Selection cleared (export will include all slices)")
 
     def _add_onset_at(self, x_sec):
         if self.y_mono is None:
@@ -606,23 +619,70 @@ class SlicerView(ttk.Frame):
             self._load_path(path)
 
     def _load_path(self, path):
+        """Lance la lecture du WAV en background pour ne pas freezer l'UI
+        (sf.read + numba JIT de librosa.onset_detect peuvent prendre 20-30s
+        au cold-start dans le bundle PyInstaller)."""
         path = Path(path)
+        self.status.config(text=f"Loading {path.name}… (decoding + transient detection)")
+        self.file_label.config(text=path.name)
+        try:
+            self.canvas.get_tk_widget().config(cursor="watch")
+        except tk.TclError:
+            pass
+        import threading
+        threading.Thread(
+            target=self._load_path_worker, args=(path,), daemon=True,
+        ).start()
+
+    def _load_path_worker(self, path: Path) -> None:
         try:
             audio, sr = sf.read(str(path), always_2d=False)
+            y_mono = (librosa.to_mono(audio.T) if audio.ndim > 1 else audio).astype(np.float32)
+            onsets = detect_transients(
+                y_mono, sr,
+                sensitivity=float(self.sensitivity.get()),
+                min_gap_ms=float(self.min_gap.get()),
+            )
         except Exception as e:
-            messagebox.showerror("Error", f"Cannot read file:\n{path}\n\n{e}")
+            err = str(e)
+            self.after(0, lambda: self._on_load_error(path, err))
             return
+        self.after(0, lambda: self._on_load_done(path, audio, sr, y_mono, onsets))
+
+    def _on_load_error(self, path: Path, err: str) -> None:
+        try:
+            self.canvas.get_tk_widget().config(cursor="")
+        except tk.TclError:
+            pass
+        self.status.config(text=f"Failed to load {path.name}")
+        messagebox.showerror("Error", f"Cannot read file:\n{path}\n\n{err}")
+
+    def _on_load_done(self, path: Path, audio, sr, y_mono, onsets) -> None:
         self.audio = audio
         self.sr = sr
-        self._cycle_idx = -1
-        self.y_mono = (librosa.to_mono(audio.T) if audio.ndim > 1 else audio).astype(np.float32)
+        self.y_mono = y_mono
         self.input_path = path
+        self.onsets = onsets
+        self._cycle_idx = -1
         ch = 1 if audio.ndim == 1 else audio.shape[1]
         self.file_label.config(
-            text=f"{path.name}  ·  {sr} Hz  ·  {ch} ch  ·  {len(self.y_mono)/sr:.2f}s"
+            text=f"{path.name}  ·  {sr} Hz  ·  {ch} ch  ·  {len(y_mono)/sr:.2f}s"
         )
         self._draw_waveform()
-        self._refresh_onsets()
+        for line in self._onset_lines:
+            line.remove()
+        self._onset_lines = [
+            self.ax.axvline(s / self.sr, color=ONSET_COLOR, linewidth=0.8, alpha=0.85)
+            for s in self.onsets
+        ]
+        self.count_label.config(text=f"{len(self.onsets)} transients detected")
+        self._clear_selection()
+        self._render_selection_cells()
+        self.canvas.draw_idle()
+        try:
+            self.canvas.get_tk_widget().config(cursor="")
+        except tk.TclError:
+            pass
         self.status.config(text=f"Loaded: {path}")
 
     def _draw_waveform(self):

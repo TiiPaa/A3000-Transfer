@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import random
-import struct
-import wave
+from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
+import soundfile as sf
 
 from .models import WavePayload
 
@@ -12,110 +13,109 @@ class WaveValidationError(Exception):
     pass
 
 
-def load_wave(path: str | Path) -> WavePayload:
-    """Charge un WAV PCM (8, 16 ou 24 bits) et retourne un WavePayload 16 bits.
+@dataclass(slots=True)
+class WaveMetadata:
+    """Métadonnées d'un WAV sans charger les données PCM. Utilisé par la GUI
+    pour afficher format/durée/taille sans le coût de la conversion."""
+    channels: int
+    sample_rate: int
+    bits_per_sample: int
+    frame_count: int
+    byte_count: int       # taille de la sortie 16-bit après conversion
+    duration_s: float
 
-    Conversion automatique vers 16 bits :
-    - 8 bits unsigned → 16 bits signed (passage signé + shift left 8)
-    - 24 bits signed → 16 bits signed avec TPDF dither (qualité pro)
-    - 16 bits → tel quel
+
+# Mapping subtype soundfile → bits affichés à l'utilisateur
+_SUBTYPE_BITS = {
+    "PCM_S8": 8,
+    "PCM_U8": 8,
+    "PCM_16": 16,
+    "PCM_24": 24,
+    "PCM_32": 32,
+    "FLOAT": 32,    # 32-bit IEEE 754 float
+    "DOUBLE": 64,   # rare mais soundfile le lit
+}
+
+
+def _validate_info(info) -> int:
+    """Retourne les bits effectifs ou raise WaveValidationError."""
+    bits = _SUBTYPE_BITS.get(info.subtype)
+    if bits is None:
+        raise WaveValidationError(
+            f"Format PCM non supporté: subtype={info.subtype!r} "
+            f"(formats acceptés : 8/16/24/32-bit int, 32-bit float)."
+        )
+    if info.channels not in (1, 2):
+        raise WaveValidationError(
+            f"Seuls les WAV mono ou stéréo sont acceptés (reçu {info.channels} canaux)."
+        )
+    if info.frames <= 0:
+        raise WaveValidationError("Le fichier WAV ne contient pas d'audio exploitable.")
+    return bits
+
+
+def peek_wave_metadata(path: str | Path) -> WaveMetadata:
+    """Lit uniquement le header du WAV via soundfile.info(). Très rapide,
+    indépendant de la taille du fichier."""
+    source = Path(path)
+    if not source.exists():
+        raise WaveValidationError(f"Fichier introuvable: {source}")
+    try:
+        info = sf.info(str(source))
+    except Exception as exc:
+        raise WaveValidationError(f"WAV invalide: {exc}") from exc
+
+    bits = _validate_info(info)
+    duration = info.frames / info.samplerate if info.samplerate else 0.0
+    return WaveMetadata(
+        channels=info.channels,
+        sample_rate=info.samplerate,
+        bits_per_sample=bits,
+        frame_count=info.frames,
+        byte_count=info.frames * info.channels * 2,  # sortie 16-bit
+        duration_s=duration,
+    )
+
+
+def load_wave(path: str | Path) -> WavePayload:
+    """Charge un WAV (8/16/24/32-bit PCM ou 32-bit float) et retourne un
+    WavePayload 16 bits LE prêt à envoyer au sampler.
+
+    - 16-bit int  → lecture directe, pas de conversion
+    - autres      → lecture en float32, dither TPDF, quantification 16-bit
     """
     source = Path(path)
     if not source.exists():
         raise WaveValidationError(f"Fichier introuvable: {source}")
 
     try:
-        with wave.open(str(source), "rb") as wav:
-            channels = wav.getnchannels()
-            sample_width = wav.getsampwidth()
-            sample_rate = wav.getframerate()
-            frame_count = wav.getnframes()
-            comp_type = wav.getcomptype()
-            pcm_data = wav.readframes(frame_count)
-    except wave.Error as exc:
+        info = sf.info(str(source))
+    except Exception as exc:
         raise WaveValidationError(f"WAV invalide: {exc}") from exc
+    _validate_info(info)
 
-    if comp_type != "NONE":
-        raise WaveValidationError("Seuls les WAV PCM non compressés sont supportés.")
-    if channels not in (1, 2):
-        raise WaveValidationError(f"Seuls les WAV mono ou stéréo sont acceptés (reçu {channels} canaux).")
-    if sample_width not in (1, 2, 3):
-        raise WaveValidationError(
-            f"Profondeur PCM non supportée: {sample_width * 8} bits (attendu 8, 16 ou 24)."
-        )
-    if frame_count <= 0 or not pcm_data:
-        raise WaveValidationError("Le fichier WAV ne contient pas d'audio exploitable.")
-
-    if sample_width == 1:
-        pcm16 = pcm8u_to_pcm16le(pcm_data)
-    elif sample_width == 2:
-        pcm16 = pcm_data
-    else:  # sample_width == 3
-        pcm16 = pcm24le_to_pcm16le_tpdf(pcm_data)
+    if info.subtype == "PCM_16":
+        # Pas de conversion → lecture directe en int16, déjà LE sur Windows
+        data, sr = sf.read(str(source), dtype="int16", always_2d=True)
+        pcm_data = data.tobytes()  # interleaved frames, LE
+    else:
+        # Lit en float32 normalisé [-1.0, 1.0], applique TPDF dither, quantifie
+        data, sr = sf.read(str(source), dtype="float32", always_2d=True)
+        rng = np.random.default_rng()
+        # TPDF dither = somme de 2 distributions uniformes ±0.5 LSB
+        # En espace float : ±1/(2*32768) chacune → ±1/32768 total
+        d1 = rng.random(data.shape, dtype=np.float32)
+        d2 = rng.random(data.shape, dtype=np.float32)
+        dithered = data + (d1 - d2) / 32768.0
+        pcm16 = np.clip(dithered * 32767.0, -32768.0, 32767.0).astype(np.int16)
+        pcm_data = pcm16.tobytes()
 
     return WavePayload(
         path=str(source),
-        channels=channels,
-        sample_rate=sample_rate,
+        channels=info.channels,
+        sample_rate=int(sr),
         bits_per_sample=16,
-        frame_count=frame_count,
-        byte_count=len(pcm16),
-        pcm_data=pcm16,
+        frame_count=info.frames,
+        byte_count=len(pcm_data),
+        pcm_data=pcm_data,
     )
-
-
-def pcm8u_to_pcm16le(pcm8: bytes) -> bytes:
-    """8-bit unsigned PCM (0..255, centré sur 128) → 16-bit signed LE."""
-    out = bytearray(len(pcm8) * 2)
-    for i, b in enumerate(pcm8):
-        signed_8 = b - 128
-        # Shift left 8 pour mapper -128..127 vers -32768..32512
-        signed_16 = signed_8 << 8
-        unsigned_16 = signed_16 & 0xFFFF
-        out[i * 2] = unsigned_16 & 0xFF
-        out[i * 2 + 1] = (unsigned_16 >> 8) & 0xFF
-    return bytes(out)
-
-
-def pcm24le_to_pcm16le_tpdf(pcm24: bytes) -> bytes:
-    """24-bit signed PCM LE → 16-bit signed PCM LE avec TPDF dithering.
-
-    TPDF (Triangular Probability Density Function) = somme de deux distributions
-    rectangulaires uniformes. Standard pro pour quantization noise shaping :
-    décorrèle le bruit de troncature du signal, le rend audible comme un noise
-    floor blanc plutôt que comme une distorsion harmonique.
-    """
-    if len(pcm24) % 3:
-        raise WaveValidationError("PCM 24 bits doit être un multiple de 3 octets.")
-
-    n_samples = len(pcm24) // 3
-    out = bytearray(n_samples * 2)
-    rng = random.Random()  # local instance, plus rapide que le module global
-
-    for i in range(n_samples):
-        in_off = i * 3
-        b0 = pcm24[in_off]
-        b1 = pcm24[in_off + 1]
-        b2 = pcm24[in_off + 2]
-        # 24-bit signed LE
-        v = b0 | (b1 << 8) | (b2 << 16)
-        if v & 0x800000:
-            v -= 0x1000000
-
-        # TPDF dither : ±256 sur l'échelle 24-bit (= ±1 LSB sur l'échelle 16-bit cible)
-        # randint(-128, 128) somme deux fois → distribution triangulaire [-256, 256]
-        v += rng.randint(-128, 128) + rng.randint(-128, 128)
-
-        # Troncature 24→16 par shift right 8 (équivalent à diviser par 256)
-        v16 = v >> 8
-        if v16 > 32767:
-            v16 = 32767
-        elif v16 < -32768:
-            v16 = -32768
-
-        # Pack LE
-        v16u = v16 & 0xFFFF
-        out[i * 2] = v16u & 0xFF
-        out[i * 2 + 1] = (v16u >> 8) & 0xFF
-
-    return bytes(out)

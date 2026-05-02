@@ -208,20 +208,34 @@ def main() -> int:
                     def progress(packet_count: int, sent: int, total: int) -> None:
                         _send(fp, {"event": "progress", "sent": sent, "total": total})
 
-                    stats = transfer_sample(
-                        handle,
-                        sample_number=sample_number,
-                        wave=wave,
-                        name=name,
-                        progress=progress,
-                        **common,
-                    )
-                    _send(fp, {
-                        "event": "done",
-                        "sample_number": stats.sample_number,
-                        "bytes_sent": stats.bytes_sent,
-                        "packet_count": stats.packet_count,
-                    })
+                    try:
+                        stats = transfer_sample(
+                            handle,
+                            sample_number=sample_number,
+                            wave=wave,
+                            name=name,
+                            progress=progress,
+                            **common,
+                        )
+                    except SmdiNoReplyPendingError:
+                        # Pendant un write, "no reply pending" = sampler refuse l'écriture.
+                        # Cause typique sur A3000 : Bulk Protect activé.
+                        _send(fp, {
+                            "event": "error",
+                            "msg": (
+                                "BULK_PROTECT:Le sampler refuse l'écriture (no reply pending). "
+                                "Probablement Bulk Protect activé sur l'A3000. "
+                                "Désactive-le sur le sampler (UTILITY → MIDI/SAMPLE → "
+                                "BulkProtect = off), puis réessaie."
+                            ),
+                        })
+                    else:
+                        _send(fp, {
+                            "event": "done",
+                            "sample_number": stats.sample_number,
+                            "bytes_sent": stats.bytes_sent,
+                            "packet_count": stats.packet_count,
+                        })
 
                 else:
                     _send(fp, {"event": "error", "msg": f"unknown cmd: {kind!r}"})

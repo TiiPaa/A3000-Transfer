@@ -34,7 +34,7 @@ try:
 except ImportError:
     HAS_DND = False
 
-from .wav_reader import WaveValidationError, load_wave
+from .wav_reader import WaveValidationError, peek_wave_metadata
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +266,10 @@ class A3000TransferApp:
 
         self._build_ui()
         self.root.after(100, self._drain_ui_events)
+        # Pré-chauffe soundfile / libsndfile en background : sinon le 1er
+        # appel à sf.info() au moment du 1er drag freeze l'UI 20-30s
+        # (initialisation différée de la DLL dans le bundle PyInstaller).
+        threading.Thread(target=_prewarm_soundfile, daemon=True).start()
 
     # ── UI building ──────────────────────────────────────────────────────────
 
@@ -609,6 +613,19 @@ class A3000TransferApp:
 
     def _on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
+        # Route selon l'onglet actif : root est l'unique drop target pour
+        # éviter le cold-load OLE de chaque widget (20-30s la 1ère fois).
+        try:
+            current = self.notebook.index(self.notebook.select())
+        except (tk.TclError, AttributeError):
+            current = 0
+        if current == 2 and paths:  # Slicer tab
+            try:
+                self.slicer_view.handle_dropped_path(Path(paths[0]))
+            except Exception:
+                pass
+            return
+        # Sinon (Upload ou Download), comportement upload classique
         self._add_paths(paths, source="drop")
 
     def _on_paste(self, event=None) -> None:
@@ -682,8 +699,10 @@ class A3000TransferApp:
                 expanded.extend(wavs)
 
         added = 0
+        new_items: list[tuple[int, Path]] = []
         for wp in expanded:
-            self._add_upload_item(wp)
+            idx = self._add_upload_item(wp)
+            new_items.append((idx, wp))
             added += 1
 
         if added:
@@ -691,7 +710,11 @@ class A3000TransferApp:
             label = {"drop": "dropped", "paste": "pasted", "picker": "added"}[source]
             s = "s" if added > 1 else ""
             arc = f" ({archives_extracted} archive{'s' if archives_extracted > 1 else ''})" if archives_extracted else ""
-            self.status_var.set(f"{added} file{s} {label}{arc}.")
+            self.status_var.set(f"{added} file{s} {label}{arc}. Reading headers…")
+            # Lecture des headers en background (sf.info peut être lent au cold-load)
+            threading.Thread(
+                target=self._peek_items_background, args=(new_items,), daemon=True,
+            ).start()
         else:
             n_paths = sum(1 for _ in paths)
             if n_paths:
@@ -701,29 +724,47 @@ class A3000TransferApp:
             elif source == "paste":
                 self.status_var.set("Clipboard: no .wav or archive.")
 
-    def _add_upload_item(self, path: Path) -> None:
-        try:
-            wave = load_wave(path)
-            ch = "stereo" if wave.channels == 2 else "mono"
-            fmt = f"{wave.sample_rate / 1000:.1f}k {ch} {wave.bits_per_sample}bits"
-            total = wave.byte_count
-            duration = wave.frame_count / wave.sample_rate if wave.sample_rate else 0
-        except WaveValidationError as exc:
-            fmt = f"<invalid: {exc}>"
-            total = 0
-            duration = 0
+    def _add_upload_item(self, path: Path) -> int:
+        """Ajoute la ligne immédiatement avec un placeholder ; le header WAV
+        est lu en background pour éviter de freezer l'UI au 1er drop
+        (cold-load libsndfile dans le bundle PyInstaller peut prendre 20s+)."""
         try:
             file_size = path.stat().st_size
         except OSError:
             file_size = 0
         sample_name = path.stem[:16]
-        item = UploadItem(path=path, total_bytes=total, file_size=file_size,
-                          duration_s=duration, fmt_str=fmt, sample_name=sample_name)
+        item = UploadItem(
+            path=path, file_size=file_size, sample_name=sample_name,
+            fmt_str="reading…",
+        )
         self.upload_items.append(item)
         idx = len(self.upload_items) - 1
         self.upload_tree.insert("", "end", iid=f"u{idx}", values=("",) * 9)
         self._refresh_upload_row(idx)
         self._update_upload_summary()
+        return idx
+
+    def _peek_items_background(self, items: list[tuple[int, Path]]) -> None:
+        """Tourne dans un thread daemon. Pour chaque (idx, path), lit le
+        header WAV via soundfile et poste un UiEvent pour mettre à jour la row."""
+        for idx, path in items:
+            try:
+                meta = peek_wave_metadata(path)
+                payload = {
+                    "channels": meta.channels,
+                    "sample_rate": meta.sample_rate,
+                    "bits_per_sample": meta.bits_per_sample,
+                    "byte_count": meta.byte_count,
+                    "duration_s": meta.duration_s,
+                }
+            except WaveValidationError as exc:
+                payload = {"error": str(exc)}
+            self.ui_queue.put(UiEvent(
+                kind="upload_meta",
+                tab="upload",
+                item_index=idx,
+                msg=json.dumps(payload),
+            ))
 
     def _on_clear_click(self) -> None:
         if self.worker_thread and self.worker_thread.is_alive():
@@ -1346,6 +1387,18 @@ class A3000TransferApp:
         if ev.item_index < 0 or ev.item_index >= len(self.upload_items):
             return
         it = self.upload_items[ev.item_index]
+        if ev.kind == "upload_meta":
+            data = json.loads(ev.msg)
+            if "error" in data:
+                it.fmt_str = f"<invalid: {data['error']}>"
+            else:
+                ch = "stereo" if data["channels"] == 2 else "mono"
+                it.fmt_str = f"{data['sample_rate'] / 1000:.1f}k {ch} {data['bits_per_sample']}bits"
+                it.total_bytes = int(data["byte_count"])
+                it.duration_s = float(data["duration_s"])
+            self._refresh_upload_row(ev.item_index)
+            self._update_upload_summary()
+            return
         if ev.kind == "start":
             it.state = "running"
             it.sample_slot = ev.sample_slot
@@ -1359,6 +1412,15 @@ class A3000TransferApp:
             it.progress = 1.0
         elif ev.kind == "error":
             it.state = "error"
+            if ev.msg.startswith("BULK_PROTECT:"):
+                clean = ev.msg[len("BULK_PROTECT:"):]
+                it.error_msg = "Bulk Protect on"
+                self.status_var.set(f"Bulk Protect on — batch interrupted.")
+                self._refresh_upload_row(ev.item_index)
+                # Stoppe le batch (les fichiers suivants échoueraient pareil)
+                self._on_stop_click()
+                messagebox.showerror("Bulk Protect activé", clean)
+                return
             it.error_msg = ev.msg
             self.status_var.set(f"Error: {it.path.name} — {ev.msg}")
         elif ev.kind == "cancelled":
@@ -1462,6 +1524,39 @@ class A3000TransferApp:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers Win32
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _prewarm_soundfile() -> None:
+    """Force toutes les initialisations différées de la stack audio :
+    libsndfile (soundfile), numba JIT (librosa.onset_detect), numpy RNG.
+
+    Sans ça :
+    - 1er sf.info/sf.read = 1-2s (libsndfile DLL load)
+    - 1er onset_detect = 20-30s (numba compile les fonctions d'analyse)
+    Tout exécuté en daemon thread pendant que la GUI s'affiche.
+    """
+    try:
+        import io
+        import numpy as np
+        import soundfile as sf
+        # Soundfile cold-load
+        buf = io.BytesIO()
+        sf.write(buf, np.zeros(44100, dtype=np.float32), 44100,
+                 format="WAV", subtype="PCM_16")
+        buf.seek(0)
+        sf.info(buf)
+        buf.seek(0)
+        sf.read(buf, dtype="int16", always_2d=True)
+        # Pré-chauffe le RNG numpy (utilisé dans load_wave dither)
+        np.random.default_rng().random((4, 2), dtype=np.float32)
+        # Pré-chauffe librosa + numba JIT en faisant tourner la détection
+        # de transients sur 1 seconde de silence — déclenche la compilation
+        # des fonctions JIT cachées
+        from a3000_transfer.slicer.engine import detect_transients
+        y = np.zeros(44100, dtype=np.float32)
+        detect_transients(y, 44100)
+    except Exception:
+        pass
+
 
 def _read_clipboard_filelist_win32() -> list[str]:
     if sys.platform != "win32":
