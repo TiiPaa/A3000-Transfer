@@ -251,6 +251,14 @@ class A3000TransferApp:
         root.title("A3000 Sample Transfer")
         root.geometry("1100x720")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Icône fenêtre (title bar + Taskbar). Cherche assets/icon.ico relatif
+        # au bundle PyInstaller (sys._MEIPASS) ou au repo en mode source.
+        icon_path = _find_icon_path()
+        if icon_path is not None:
+            try:
+                root.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
 
         # State
         self.upload_items: list[UploadItem] = []
@@ -1524,6 +1532,23 @@ class A3000TransferApp:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers Win32
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _find_icon_path() -> Path | None:
+    """Retourne le chemin vers assets/icon.ico (bundle PyInstaller ou repo)."""
+    candidates = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(Path(base) / "assets" / "icon.ico")
+    here = Path(__file__).resolve().parent
+    candidates.extend([
+        here.parent / "assets" / "icon.ico",
+        here.parent.parent / "python" / "assets" / "icon.ico",
+    ])
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
 
 def _prewarm_soundfile() -> None:
     """Force toutes les initialisations différées de la stack audio :

@@ -16,6 +16,9 @@ hiddenimports += [
     "a3000_transfer.slicer.view",
 ]
 
+# Icône embarquée comme datafile pour iconbitmap() runtime (title bar / Taskbar)
+datas += [("assets/icon.ico", "assets")]
+
 a = Analysis(
     ["a3000_transfer/__main__.py"],
     pathex=["."],
@@ -46,7 +49,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon="assets/icon.ico",
 )
 
 coll = COLLECT(
