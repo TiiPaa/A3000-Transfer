@@ -32,6 +32,13 @@ except ImportError:
     DND_AVAILABLE = False
 
 try:
+    import mido
+    MIDI_AVAILABLE = True
+except ImportError:
+    mido = None
+    MIDI_AVAILABLE = False
+
+try:
     import sounddevice as sd
     AUDIO_AVAILABLE = True
 except (ImportError, OSError):
@@ -111,6 +118,22 @@ class SlicerView(ttk.Frame):
         ttk.Button(top, text="Export to folder…", command=self.export_slices).pack(
             side=tk.RIGHT, padx=(0, 8),
         )
+        # Drag-MIDI vers DAW : Label stylé en bouton (les Buttons tk
+        # interceptent le mousedown → tkinterdnd2 drag source ne fire pas)
+        self.midi_btn = tk.Label(
+            top, text="↓ Drag MIDI",
+            bg="#4CAF50", fg="white",
+            font=("", 9, "bold"),
+            relief="raised", borderwidth=2, padx=10, pady=4,
+            cursor="hand2",
+        )
+        self.midi_btn.pack(side=tk.RIGHT, padx=(0, 8))
+        if DND_AVAILABLE and MIDI_AVAILABLE:
+            self.midi_btn.drag_source_register(1, DND_FILES)
+            self.midi_btn.dnd_bind("<<DragInitCmd>>", self._on_midi_drag_init)
+            # Effet visuel feedback au hover
+            self.midi_btn.bind("<Enter>", lambda _e: self.midi_btn.config(bg="#388E3C"))
+            self.midi_btn.bind("<Leave>", lambda _e: self.midi_btn.config(bg="#4CAF50"))
         ttk.Button(top, text="Deselect all", command=self._deselect_all).pack(
             side=tk.RIGHT, padx=(0, 8),
         )
@@ -832,6 +855,62 @@ class SlicerView(ttk.Frame):
         scope = "selected" if self._selected_slice_indices() else "all"
         self.status.config(text=f"{n} {scope} slice(s) written to {out}")
         messagebox.showinfo("Done", f"{n} {scope} slice(s) written to:\n{out}")
+
+    # ── MIDI export ──────────────────────────────────────────────────────────
+
+    def _generate_midi_temp(self) -> Optional[Path]:
+        """Génère un fichier .mid temp : 1 note par slice, chromatique C2+,
+        timestamps des onsets convertis en ticks à 120 BPM. Retourne le path
+        ou None si pas de slices."""
+        if not MIDI_AVAILABLE:
+            self.status.config(text="MIDI export unavailable (mido not installed)")
+            return None
+        if self.input_path is None or len(self.onsets) == 0 or self.sr is None:
+            self.status.config(text="Load a WAV and detect transients first.")
+            return None
+
+        ppq = 480
+        bpm = 120
+        tempo = mido.bpm2tempo(bpm)  # microsec per beat
+        # 1 second = bpm/60 beats = bpm/60 * ppq ticks
+        sec_to_ticks = lambda s: int(round(s * bpm / 60 * ppq))
+
+        mid = mido.MidiFile(ticks_per_beat=ppq)
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+        track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+        track.append(mido.MetaMessage("track_name", name=self.input_path.stem[:32], time=0))
+
+        base_note = 36  # C2
+        last_tick = 0
+        total_samples = len(self.y_mono)
+        for i, onset in enumerate(self.onsets):
+            start_sec = float(onset) / self.sr
+            end_sample = int(self.onsets[i + 1]) if i + 1 < len(self.onsets) else total_samples
+            end_sec = float(end_sample) / self.sr
+            start_tick = sec_to_ticks(start_sec)
+            end_tick = sec_to_ticks(end_sec)
+            note = min(127, base_note + i)
+            delta_on = max(0, start_tick - last_tick)
+            delta_off = max(1, end_tick - start_tick)
+            track.append(mido.Message("note_on", note=note, velocity=100, time=delta_on))
+            track.append(mido.Message("note_off", note=note, velocity=0, time=delta_off))
+            last_tick = end_tick
+
+        out_dir = Path(tempfile.mkdtemp(prefix="a3000_slicer_midi_"))
+        midi_path = out_dir / f"{self.input_path.stem}_slices.mid"
+        mid.save(str(midi_path))
+        return midi_path
+
+    def _on_midi_drag_init(self, event):
+        """Handler tkinterdnd2 : génère le .mid et le passe en drag-out OLE."""
+        midi_path = self._generate_midi_temp()
+        if midi_path is None:
+            return None
+        self.status.config(text=f"Dragging {midi_path.name} → drop in your DAW")
+        # Wrap dans {} : Tcl list syntax pour échapper () et espaces dans le path
+        # (sans ça, tkdnd parse mal et le DAW refuse le drop)
+        return (("copy",), (DND_FILES,), "{" + str(midi_path) + "}")
 
     def _on_send_to_upload_click(self):
         if self.input_path is None or len(self.onsets) == 0:

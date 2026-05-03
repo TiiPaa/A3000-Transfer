@@ -14,6 +14,8 @@ hiddenimports += [
     "a3000_transfer._worker",
     "a3000_transfer.slicer.engine",
     "a3000_transfer.slicer.view",
+    "mido",
+    "mido.midifiles",
 ]
 
 # Icône embarquée comme datafile pour iconbitmap() runtime (title bar / Taskbar)

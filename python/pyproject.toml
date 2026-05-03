@@ -9,6 +9,7 @@ dependencies = [
     "librosa",
     "soundfile",
     "matplotlib",
+    "mido",
 ]
 
 [project.optional-dependencies]
