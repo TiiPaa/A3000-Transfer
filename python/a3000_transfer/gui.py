@@ -249,7 +249,8 @@ class A3000TransferApp:
     def __init__(self, root) -> None:
         self.root = root
         root.title("A3000 Sample Transfer")
-        root.geometry("1100x720")
+        root.geometry("1200x820")
+        root.minsize(1000, 720)  # empêche la troncature de la bottom bar
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         # Icône fenêtre (title bar + Taskbar). Cherche assets/icon.ico relatif
         # au bundle PyInstaller (sys._MEIPASS) ou au repo en mode source.
@@ -271,13 +272,25 @@ class A3000TransferApp:
         self._temp_dirs: list[Path] = []  # extracted archive dirs, cleaned on close
         self._playing_path: Path | None = None
         self._pending_toggle = None  # after-id for deferred checkbox toggle
+        self.is_first_launch = _is_numba_cache_empty()
 
         self._build_ui()
         self.root.after(100, self._drain_ui_events)
-        # Pré-chauffe soundfile / libsndfile en background : sinon le 1er
-        # appel à sf.info() au moment du 1er drag freeze l'UI 20-30s
-        # (initialisation différée de la DLL dans le bundle PyInstaller).
-        threading.Thread(target=_prewarm_soundfile, daemon=True).start()
+        # Pré-chauffe soundfile + numba en background. Au 1er lancement
+        # (cache numba vide) ça prend 20-30s : on affiche une bannière pour
+        # expliquer à l'utilisateur ce qui se passe.
+        if self.is_first_launch:
+            self.banner.config(
+                text="⏳ Première utilisation : compilation du moteur audio (~30s, "
+                     "une seule fois — ne ferme pas l'app)",
+                background="#FF9800",
+            )
+            self.banner.pack(fill="x", before=self.notebook)
+        threading.Thread(
+            target=lambda: (_prewarm_soundfile(),
+                            self.ui_queue.put(UiEvent(kind="prewarm_done"))),
+            daemon=True,
+        ).start()
 
     # ── UI building ──────────────────────────────────────────────────────────
 
@@ -288,6 +301,13 @@ class A3000TransferApp:
         self.bus_var = tk.IntVar(value=int(saved.get("bus", 0)))
         self.target_var = tk.IntVar(value=int(saved.get("target", 0)))
         self.lun_var = tk.IntVar(value=int(saved.get("lun", 0)))
+
+        # Bannière première-utilisation : créée mais pas packée par défaut
+        # (packée seulement si is_first_launch dans __init__ après _build_ui)
+        self.banner = tk.Label(
+            self.root, text="", foreground="white", background="#FF9800",
+            font=("", 10, "bold"), padx=10, pady=8,
+        )
 
         # Notebook
         self.notebook = ttk.Notebook(self.root)
@@ -304,9 +324,11 @@ class A3000TransferApp:
         self._build_download_tab(download_tab)
         self._build_slicer_tab(slicer_tab)
 
-        # Bottom bar : Interrompre + Status
+        # Bottom bar : Interrompre + Status. side="bottom" ancre la barre
+        # en bas — sinon le notebook (expand=True) la pousse hors de vue
+        # quand le contenu d'un onglet demande beaucoup de hauteur (slicer).
         bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", padx=10, pady=(5, 10))
+        bottom.pack(side="bottom", fill="x", padx=10, pady=(5, 10))
         self.stop_btn = ttk.Button(bottom, text="Stop",
                                    command=self._on_stop_click, state="disabled")
         self.stop_btn.pack(side="left")
@@ -1366,6 +1388,17 @@ class A3000TransferApp:
             samples = json.loads(ev.msg)
             self._populate_download_list(samples)
             return
+        if ev.kind == "prewarm_done":
+            if self.is_first_launch:
+                self.banner.config(
+                    text="✓ Moteur audio compilé et mis en cache. Les prochains "
+                         "lancements seront instantanés.",
+                    background="#4CAF50",
+                )
+                # Auto-hide après 5s
+                self.root.after(5000, self.banner.pack_forget)
+                self.is_first_launch = False
+            return
         if ev.kind == "allfinished":
             self._set_idle()
             if self.current_tab == "upload":
@@ -1532,6 +1565,23 @@ class A3000TransferApp:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers Win32
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_numba_cache_empty() -> bool:
+    """Détecte si numba n'a encore jamais compilé sur cette machine.
+    True = 1er lancement → on affichera une bannière pendant le prewarm."""
+    cache_dir = os.environ.get("NUMBA_CACHE_DIR", "")
+    if not cache_dir:
+        return True
+    p = Path(cache_dir)
+    if not p.exists():
+        return True
+    # Si au moins un fichier compilé existe, c'est un re-lancement
+    for f in p.rglob("*.nbc"):
+        return False
+    for f in p.rglob("*.nbi"):
+        return False
+    return True
+
 
 def _find_icon_path() -> Path | None:
     """Retourne le chemin vers assets/icon.ico (bundle PyInstaller ou repo)."""

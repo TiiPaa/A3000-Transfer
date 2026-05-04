@@ -56,6 +56,16 @@ BG_PLOT = "#1e1e1e"
 BG_FIG = "#2b2b2b"
 
 
+def _truncate_name(name: str, max_chars: int) -> str:
+    """Tronque un nom de fichier en gardant le début et la fin (avec
+    l'extension typiquement)."""
+    if len(name) <= max_chars:
+        return name
+    keep_start = (max_chars - 1) // 2
+    keep_end = max_chars - 1 - keep_start
+    return name[:keep_start] + "…" + name[-keep_end:]
+
+
 class SlicerView(ttk.Frame):
     """Frame embarquable contenant la waveform, les sliders de détection
     de transients et les boutons Send to Upload / Export to folder.
@@ -87,7 +97,20 @@ class SlicerView(ttk.Frame):
         self._wave_artists = []
         self._hint_artist = None
         self._rendering = False
-        self._selected_midpoints = set()
+        # Selection trackée par INDEX de slice (pas par midpoint sample) :
+        # plus stable quand on déplace les cuts (la slice garde son identité
+        # même quand son midpoint passe dans une slice voisine)
+        self._selected_indices: set[int] = set()
+        # Slices marquées "supprimées" → skip à l'export (right-click sur cell)
+        self._deleted_indices: set[int] = set()
+        # State pour le drag-select dans le bandeau supérieur
+        self._drag_state: bool = False         # True = on ajoute, False = on retire
+        self._drag_visited: set[int] = set()
+        # State pour le bouton ▶ Loop
+        self._is_looping: bool = False
+        self._play_start_time: float = 0.0
+        self._playhead_line = None
+        self._playhead_after_id = None
         self._selection_cells = []
         self._cycle_idx = -1  # index du cut actuellement centré (Space pour cycler)
 
@@ -97,16 +120,54 @@ class SlicerView(ttk.Frame):
     # ── Construction UI ──────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # Row 1 : file + playback + Reset
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(top, text="Open WAV…", command=self.open_file).pack(side=tk.LEFT)
-        self.file_label = ttk.Label(top, text="No file loaded")
+        # Bouton play + loop du sample entier
+        # width=11 pour que la taille ne change pas entre "▶ Loop" et "⏹ Stop loop"
+        self.loop_btn = tk.Button(
+            top, text="▶ Loop", command=self._toggle_loop_play,
+            bg="#1976D2", fg="white",
+            activebackground="#1565C0", activeforeground="white",
+            disabledforeground="#BDBDBD",
+            font=("", 9, "bold"),
+            relief="raised", borderwidth=1, padx=10, pady=2,
+            cursor="hand2", width=11,
+        )
+        self.loop_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.file_label = ttk.Label(top, text="No file loaded", width=44, anchor="w")
         self.file_label.pack(side=tk.LEFT, padx=10)
+        ttk.Button(top, text="Reset", command=self._reset_to_default).pack(
+            side=tk.RIGHT,
+        )
+
+        # Row 2 : édition (delete/select) + export (MIDI/Upload/Folder)
+        top2 = ttk.Frame(self, padding=(8, 0, 8, 6))
+        top2.pack(side=tk.TOP, fill=tk.X)
+
+        # Bouton rouge : applique la suppression des sections marquées
+        self.delete_marked_btn = tk.Button(
+            top2, text="🗑 Delete marked", command=self._commit_deletions,
+            bg="#d04848", fg="white",
+            activebackground="#b03838", activeforeground="white",
+            disabledforeground="#BDBDBD",
+            font=("", 9, "bold"),
+            relief="raised", borderwidth=1, padx=10, pady=2,
+            cursor="hand2",
+        )
+        self.delete_marked_btn.pack(side=tk.LEFT)
+        ttk.Button(top2, text="Select all", command=self._select_all).pack(
+            side=tk.LEFT, padx=(8, 0),
+        )
+        ttk.Button(top2, text="Deselect all", command=self._deselect_all).pack(
+            side=tk.LEFT, padx=(8, 0),
+        )
 
         # Boutons d'export à droite : Send to Upload (bleu) + Export to folder
         self.send_btn = tk.Button(
-            top, text="Send to Upload", command=self._on_send_to_upload_click,
+            top2, text="Send to Upload", command=self._on_send_to_upload_click,
             bg="#1976D2", fg="white",
             activebackground="#1565C0", activeforeground="white",
             disabledforeground="#BDBDBD",
@@ -115,13 +176,12 @@ class SlicerView(ttk.Frame):
             cursor="hand2",
         )
         self.send_btn.pack(side=tk.RIGHT)
-        ttk.Button(top, text="Export to folder…", command=self.export_slices).pack(
+        ttk.Button(top2, text="Export to folder…", command=self.export_slices).pack(
             side=tk.RIGHT, padx=(0, 8),
         )
-        # Drag-MIDI vers DAW : Label stylé en bouton (les Buttons tk
-        # interceptent le mousedown → tkinterdnd2 drag source ne fire pas)
+        # Drag-MIDI vers DAW
         self.midi_btn = tk.Label(
-            top, text="↓ Drag MIDI",
+            top2, text="↓ Drag MIDI",
             bg="#4CAF50", fg="white",
             font=("", 9, "bold"),
             relief="raised", borderwidth=2, padx=10, pady=4,
@@ -131,15 +191,13 @@ class SlicerView(ttk.Frame):
         if DND_AVAILABLE and MIDI_AVAILABLE:
             self.midi_btn.drag_source_register(1, DND_FILES)
             self.midi_btn.dnd_bind("<<DragInitCmd>>", self._on_midi_drag_init)
-            # Effet visuel feedback au hover
             self.midi_btn.bind("<Enter>", lambda _e: self.midi_btn.config(bg="#388E3C"))
             self.midi_btn.bind("<Leave>", lambda _e: self.midi_btn.config(bg="#4CAF50"))
-        ttk.Button(top, text="Deselect all", command=self._deselect_all).pack(
-            side=tk.RIGHT, padx=(0, 8),
-        )
-        ttk.Button(top, text="Select all", command=self._select_all).pack(
-            side=tk.RIGHT, padx=(0, 4),
-        )
+        # Beats spinbox pour calcul du BPM MIDI
+        self.beats_var = tk.IntVar(value=16)
+        ttk.Spinbox(top2, from_=1, to=512, increment=1, textvariable=self.beats_var,
+                    width=5).pack(side=tk.RIGHT, padx=(0, 4))
+        ttk.Label(top2, text="Beats:").pack(side=tk.RIGHT, padx=(0, 2))
 
         controls = ttk.LabelFrame(self, text="Detection", padding=8)
         controls.pack(side=tk.TOP, fill=tk.X, padx=8, pady=4)
@@ -169,8 +227,9 @@ class SlicerView(ttk.Frame):
 
         help_text = (
             "Left click: play  ·  Drag cut: move  ·  Drag empty: pan  ·  "
-            "Wheel: zoom  ·  Right click: add/remove cut  ·  "
-            "Top strip: toggle slice export"
+            "Wheel: zoom  ·  Right click: add/remove cut\n"
+            "Top strip — Left click: select for export  ·  "
+            "Right click: mark for deletion (apply with 'Delete marked')"
         )
         ttk.Label(controls, text=help_text, foreground="#888").grid(
             row=3, column=0, columnspan=3, sticky=tk.W, pady=(2, 0),
@@ -305,8 +364,41 @@ class SlicerView(ttk.Frame):
             pass
 
         if event.inaxes is self.sel_ax:
-            if event.button == 1 and event.xdata is not None and self.y_mono is not None:
-                self._toggle_selection_at(float(event.xdata))
+            if event.xdata is None or self.y_mono is None:
+                return
+            info = self._slice_range_at(float(event.xdata))
+            if info is None:
+                return
+            idx = info[0]
+            if event.button == 1:
+                # Toggle ce cell + entre en mode drag-select pour étendre
+                self._deleted_indices.discard(idx)
+                if idx in self._selected_indices:
+                    self._selected_indices.discard(idx)
+                    self._drag_state = False
+                else:
+                    self._selected_indices.add(idx)
+                    self._drag_state = True
+                self._mode = "select_drag"
+                self._drag_visited = {idx}
+                self._render_selection_cells()
+                n = len(self._selected_indices)
+                self.status.config(text=f"{n} selected (drag to extend)")
+                return
+            if event.button == 3:
+                self._selected_indices.discard(idx)
+                if idx in self._deleted_indices:
+                    self._deleted_indices.discard(idx)
+                    self._drag_state = False
+                else:
+                    self._deleted_indices.add(idx)
+                    self._drag_state = True
+                self._mode = "delete_drag"
+                self._drag_visited = {idx}
+                self._render_selection_cells()
+                n = len(self._deleted_indices)
+                self.status.config(text=f"{n} marked (drag to extend, then 'Delete marked')")
+                return
             return
 
         if event.inaxes is not self.ax:
@@ -348,21 +440,173 @@ class SlicerView(ttk.Frame):
         info = self._slice_range_at(x_sec)
         if info is None:
             return
-        _, start, end = info
-        existing = next(
-            (m for m in self._selected_midpoints if start <= m < end),
-            None,
-        )
-        if existing is not None:
-            self._selected_midpoints.discard(existing)
+        idx, _, _ = info
+        # Une slice "deleted" ne peut pas être sélectionnée — on retire le delete
+        self._deleted_indices.discard(idx)
+        if idx in self._selected_indices:
+            self._selected_indices.discard(idx)
         else:
-            self._selected_midpoints.add((start + end) // 2)
+            self._selected_indices.add(idx)
         self._render_selection_cells()
-        n = len(self._selected_midpoints)
+        n = len(self._selected_indices)
         if n == 0:
             self.status.config(text="No slice selected — export will include all")
         else:
             self.status.config(text=f"{n} slice{'s' if n > 1 else ''} selected")
+
+    def _toggle_delete_at(self, x_sec):
+        """Right-click sur une cellule : marque la section en rouge.
+        Le bouton "Delete marked" applique réellement la suppression."""
+        info = self._slice_range_at(x_sec)
+        if info is None:
+            return
+        idx, _, _ = info
+        # Mutuellement exclusif avec la sélection
+        self._selected_indices.discard(idx)
+        if idx in self._deleted_indices:
+            self._deleted_indices.discard(idx)
+        else:
+            self._deleted_indices.add(idx)
+        self._render_selection_cells()
+        n_del = len(self._deleted_indices)
+        if n_del == 0:
+            self.status.config(text="No section marked for deletion.")
+        else:
+            self.status.config(
+                text=f"{n_del} section{'s' if n_del > 1 else ''} marked. "
+                     "Click 'Delete marked' to apply."
+            )
+
+    def _toggle_loop_play(self):
+        """Lance / arrête la lecture en boucle du sample entier."""
+        if not AUDIO_AVAILABLE:
+            self.status.config(text="Playback unavailable (install sounddevice)")
+            return
+        if self._is_looping:
+            self._stop_loop_if_playing()
+            return
+        if self.audio is None or self.sr is None:
+            self.status.config(text="Load a WAV first.")
+            return
+        try:
+            sd.stop()
+            sd.play(self.audio, self.sr, loop=True)
+        except Exception as e:
+            self.status.config(text=f"Playback error: {e}")
+            return
+        import time as _time
+        self._is_looping = True
+        self._play_start_time = _time.time()
+        self.loop_btn.config(text="⏹ Stop loop", bg="#d04848",
+                             activebackground="#b03838")
+        # Crée la tête de lecture jaune et démarre la boucle de mise à jour
+        self._playhead_line = self.ax.axvline(
+            0, color="#ffd866", linewidth=1.6, alpha=0.95, zorder=5,
+        )
+        self._update_playhead()
+        dur = len(self.y_mono) / self.sr if self.sr else 0
+        self.status.config(text=f"▶ Looping ({dur:.2f}s)")
+
+    def _update_playhead(self):
+        """Met à jour la position de la tête de lecture toutes les ~33 ms."""
+        if not self._is_looping or self.y_mono is None or self.sr is None:
+            return
+        import time as _time
+        elapsed = _time.time() - self._play_start_time
+        duration = len(self.y_mono) / self.sr
+        if duration <= 0:
+            return
+        pos = elapsed % duration
+        if self._playhead_line is not None:
+            try:
+                self._playhead_line.set_xdata([pos, pos])
+                self.canvas.draw_idle()
+            except Exception:
+                pass
+        self._playhead_after_id = self.after(33, self._update_playhead)
+
+    def _stop_loop_if_playing(self):
+        if not self._is_looping:
+            return
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        self._is_looping = False
+        if self._playhead_after_id is not None:
+            try:
+                self.after_cancel(self._playhead_after_id)
+            except Exception:
+                pass
+            self._playhead_after_id = None
+        if self._playhead_line is not None:
+            try:
+                self._playhead_line.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._playhead_line = None
+            self.canvas.draw_idle()
+        self.loop_btn.config(text="▶ Loop", bg="#1976D2",
+                             activebackground="#1565C0")
+        self.status.config(text="Loop stopped")
+
+    def _commit_deletions(self):
+        """Applique les suppressions marquées : retire l'audio des sections
+        rouges du buffer et reconstruit les onsets en conservant les autres
+        cuts à leur position relative dans le nouveau timeline."""
+        if not self._deleted_indices or self.y_mono is None:
+            self.status.config(text="No section marked for deletion.")
+            return
+        self._stop_loop_if_playing()
+        n = len(self.onsets)
+        deleted = {i for i in self._deleted_indices if 0 <= i < n}
+        keep = [i for i in range(n) if i not in deleted]
+        if not keep:
+            self.status.config(text="Cannot delete all sections.")
+            return
+
+        # Reconstruction du buffer audio (mono ou stéréo) en concaténant
+        # uniquement les slices non supprimées
+        audio_chunks = []
+        y_chunks = []
+        new_onsets = [0]
+        cumulative = 0
+        for k_pos, idx in enumerate(keep):
+            start = int(self.onsets[idx])
+            end = int(self.onsets[idx + 1]) if idx + 1 < n else len(self.y_mono)
+            audio_chunks.append(self.audio[start:end])
+            y_chunks.append(self.y_mono[start:end])
+            cumulative += end - start
+            if k_pos < len(keep) - 1:
+                new_onsets.append(cumulative)
+        self.audio = np.concatenate(audio_chunks, axis=0)
+        self.y_mono = np.concatenate(y_chunks, axis=0)
+        self.onsets = np.array(new_onsets, dtype=np.int64)
+
+        n_deleted = len(deleted)
+        self._deleted_indices.clear()
+        self._selected_indices.clear()
+        self._cycle_idx = -1
+
+        # Redraw waveform + onset lines avec les nouveaux onsets (preservés)
+        self._draw_waveform()
+        for line in self._onset_lines:
+            try:
+                line.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._onset_lines = [
+            self.ax.axvline(s / self.sr, color=ONSET_COLOR, linewidth=0.8, alpha=0.85)
+            for s in self.onsets
+        ]
+        self.count_label.config(text=f"{len(self.onsets)} transients detected")
+        self._render_selection_cells()
+        self.canvas.draw_idle()
+
+        new_dur = len(self.y_mono) / self.sr if self.sr else 0
+        self.status.config(
+            text=f"Deleted {n_deleted} section(s). New duration: {new_dur:.2f}s"
+        )
 
     def _render_selection_cells(self):
         for cell in self._selection_cells:
@@ -376,28 +620,28 @@ class SlicerView(ttk.Frame):
             self.canvas.draw_idle()
             return
 
-        selected_indices = set()
-        valid_midpoints = set()
-        for m in self._selected_midpoints:
-            info = self._slice_range_at(m / self.sr) if self.sr else None
-            if info is None:
-                continue
-            idx, start, end = info
-            if start <= m < end:
-                selected_indices.add(idx)
-                valid_midpoints.add(m)
-        self._selected_midpoints = valid_midpoints
+        # Filtre les indices encore valides
+        n_slices = len(self.onsets)
+        self._selected_indices = {i for i in self._selected_indices if 0 <= i < n_slices}
+        self._deleted_indices = {i for i in self._deleted_indices if 0 <= i < n_slices}
+        selected_indices = self._selected_indices
+        deleted_indices = self._deleted_indices
 
-        for i in range(len(self.onsets)):
+        DELETE_COLOR = "#d04848"  # rouge pour slices supprimées
+        for i in range(n_slices):
             start = int(self.onsets[i])
-            end = int(self.onsets[i + 1]) if i + 1 < len(self.onsets) else len(self.y_mono)
+            end = int(self.onsets[i + 1]) if i + 1 < n_slices else len(self.y_mono)
             x0 = start / self.sr
             w = max(1.0 / self.sr, (end - start) / self.sr)
-            is_sel = i in selected_indices
+            if i in deleted_indices:
+                facecolor, edgecolor = DELETE_COLOR, DELETE_COLOR
+            elif i in selected_indices:
+                facecolor, edgecolor = SELECTION_COLOR, SELECTION_COLOR
+            else:
+                facecolor, edgecolor = "#3a3a3a", "#555"
             rect = Rectangle(
                 (x0, 0.12), w, 0.76,
-                facecolor=SELECTION_COLOR if is_sel else "#3a3a3a",
-                edgecolor=SELECTION_COLOR if is_sel else "#555",
+                facecolor=facecolor, edgecolor=edgecolor,
                 linewidth=0.8,
             )
             self.sel_ax.add_patch(rect)
@@ -406,26 +650,40 @@ class SlicerView(ttk.Frame):
         self.canvas.draw_idle()
 
     def _clear_selection(self):
-        self._selected_midpoints.clear()
+        self._selected_indices.clear()
+        self._deleted_indices.clear()
         self._render_selection_cells()
 
     def _select_all(self):
         if self.y_mono is None or len(self.onsets) == 0:
             return
-        self._selected_midpoints.clear()
-        for i in range(len(self.onsets)):
-            start = int(self.onsets[i])
-            end = int(self.onsets[i + 1]) if i + 1 < len(self.onsets) else len(self.y_mono)
-            self._selected_midpoints.add((start + end) // 2)
+        self._selected_indices = set(range(len(self.onsets)))
         self._render_selection_cells()
         self.status.config(text=f"All {len(self.onsets)} slices selected")
 
     def _deselect_all(self):
-        if not self._selected_midpoints:
+        if not self._selected_indices:
             return
-        self._selected_midpoints.clear()
+        self._selected_indices.clear()
         self._render_selection_cells()
         self.status.config(text="Selection cleared (export will include all slices)")
+
+    def _reset_to_default(self):
+        """Remet sliders à leurs valeurs par défaut ET recharge l'audio depuis
+        le fichier d'origine (annule les "Delete marked" appliqués)."""
+        if self.input_path is None:
+            self.status.config(text="Load a WAV first.")
+            return
+        self.sensitivity.set(1.0)
+        self.min_gap.set(30)
+        self.sens_label.config(text="1.00")
+        self.gap_label.config(text="30")
+        self._selected_indices.clear()
+        self._deleted_indices.clear()
+        # Reload depuis le disque : restore l'audio source intact + redétecte
+        # avec les params défaut (le worker thread lit self.sensitivity/min_gap
+        # qu'on vient de remettre à 1.0 / 30)
+        self._load_path(self.input_path)
 
     def _add_onset_at(self, x_sec):
         if self.y_mono is None:
@@ -439,6 +697,13 @@ class SlicerView(ttk.Frame):
             sample / self.sr, color=ONSET_COLOR, linewidth=0.8, alpha=0.85,
         )
         self._onset_lines.insert(insert_idx, line)
+        # Décale les indices sélectionnés / supprimés ≥ insert_idx
+        self._selected_indices = {
+            (i + 1 if i >= insert_idx else i) for i in self._selected_indices
+        }
+        self._deleted_indices = {
+            (i + 1 if i >= insert_idx else i) for i in self._deleted_indices
+        }
         self.count_label.config(text=f"{len(self.onsets)} transients detected")
         self.status.config(text=f"+ cut at {sample / self.sr:.3f}s")
         self._render_selection_cells()
@@ -454,12 +719,47 @@ class SlicerView(ttk.Frame):
         self._onset_lines.pop(idx)
         removed_t = float(self.onsets[idx]) / self.sr
         self.onsets = np.delete(self.onsets, idx)
+        # Décale les indices sélectionnés / supprimés > idx (la slice idx-1
+        # absorbe l'ancienne idx)
+        self._selected_indices = {
+            (i - 1 if i > idx else i)
+            for i in self._selected_indices
+            if i != idx
+        }
+        self._deleted_indices = {
+            (i - 1 if i > idx else i)
+            for i in self._deleted_indices
+            if i != idx
+        }
         self.count_label.config(text=f"{len(self.onsets)} transients detected")
         self.status.config(text=f"− cut at {removed_t:.3f}s removed")
         self._render_selection_cells()
         self.canvas.draw_idle()
 
     def _on_motion(self, event):
+        # Drag-select dans le bandeau supérieur : étend la sélection / le
+        # marquage aux cellules adjacentes pendant qu'on maintient le clic
+        if self._mode in ("select_drag", "delete_drag"):
+            if event.inaxes is self.sel_ax and event.xdata is not None:
+                info = self._slice_range_at(float(event.xdata))
+                if info is not None:
+                    idx = info[0]
+                    if idx not in self._drag_visited:
+                        self._drag_visited.add(idx)
+                        if self._mode == "select_drag":
+                            self._deleted_indices.discard(idx)
+                            if self._drag_state:
+                                self._selected_indices.add(idx)
+                            else:
+                                self._selected_indices.discard(idx)
+                        else:  # delete_drag
+                            self._selected_indices.discard(idx)
+                            if self._drag_state:
+                                self._deleted_indices.add(idx)
+                            else:
+                                self._deleted_indices.discard(idx)
+                        self._render_selection_cells()
+            return
         if event.inaxes != self.ax:
             return
         if self._mode is None:
@@ -479,6 +779,9 @@ class SlicerView(ttk.Frame):
             new_sample = int(np.clip(x * self.sr, 0, len(self.y_mono) - 1))
             self.onsets[self._drag_idx] = new_sample
             self._onset_lines[self._drag_idx].set_xdata([x, x])
+            # Mise à jour live des selection cells (sinon elles ne suivent pas
+            # le déplacement du cut tant que l'utilisateur n'a pas relâché)
+            self._render_selection_cells()
             self.status.config(text=f"Cut #{self._drag_idx + 1} → {x:.3f}s")
             self.canvas.draw_idle()
             return
@@ -507,9 +810,22 @@ class SlicerView(ttk.Frame):
     def _on_release(self, event):
         mode = self._mode
         self._mode = None
+        if mode in ("select_drag", "delete_drag"):
+            self._drag_visited = set()
+            return
         if mode == "drag_cut":
             self._drag_idx = None
             order = np.argsort(self.onsets)
+            # Si le tri a changé l'ordre (drag à travers un autre cut), il
+            # faut remapper les indices sélectionnés vers leur nouvelle position
+            if not np.array_equal(order, np.arange(len(self.onsets))):
+                old_to_new = {int(old): new for new, old in enumerate(order)}
+                self._selected_indices = {
+                    old_to_new[i] for i in self._selected_indices if i in old_to_new
+                }
+                self._deleted_indices = {
+                    old_to_new[i] for i in self._deleted_indices if i in old_to_new
+                }
             self.onsets = self.onsets[order]
             self._onset_lines = [self._onset_lines[i] for i in order]
             self._render_selection_cells()
@@ -645,9 +961,10 @@ class SlicerView(ttk.Frame):
         """Lance la lecture du WAV en background pour ne pas freezer l'UI
         (sf.read + numba JIT de librosa.onset_detect peuvent prendre 20-30s
         au cold-start dans le bundle PyInstaller)."""
+        self._stop_loop_if_playing()
         path = Path(path)
         self.status.config(text=f"Loading {path.name}… (decoding + transient detection)")
-        self.file_label.config(text=path.name)
+        self.file_label.config(text=_truncate_name(path.name, 42))
         try:
             self.canvas.get_tk_widget().config(cursor="watch")
         except tk.TclError:
@@ -688,8 +1005,9 @@ class SlicerView(ttk.Frame):
         self.onsets = onsets
         self._cycle_idx = -1
         ch = 1 if audio.ndim == 1 else audio.shape[1]
+        short = _truncate_name(path.name, 24)
         self.file_label.config(
-            text=f"{path.name}  ·  {sr} Hz  ·  {ch} ch  ·  {len(y_mono)/sr:.2f}s"
+            text=f"{short}  ·  {sr} Hz  ·  {ch} ch  ·  {len(y_mono)/sr:.2f}s"
         )
         self._draw_waveform()
         for line in self._onset_lines:
@@ -817,17 +1135,27 @@ class SlicerView(ttk.Frame):
     # ── Export ───────────────────────────────────────────────────────────────
 
     def _selected_slice_indices(self):
-        if not self._selected_midpoints or len(self.onsets) == 0:
+        """Retourne la liste d'indices à exporter, ou None pour "tout".
+
+        Logique :
+        - Si des slices sont marquées "deleted" : exporte tout SAUF elles
+          (en respectant aussi la sélection si non vide)
+        - Sinon, si une sélection existe : exporte uniquement les sélectionnées
+        - Sinon : retourne None → exporte tout
+        """
+        if len(self.onsets) == 0:
             return None
-        indices = set()
-        for m in self._selected_midpoints:
-            idx = int(np.searchsorted(self.onsets, m, side="right") - 1)
-            idx = max(0, idx)
-            start = int(self.onsets[idx])
-            end = int(self.onsets[idx + 1]) if idx + 1 < len(self.onsets) else len(self.y_mono)
-            if start <= m < end:
-                indices.add(idx)
-        return sorted(indices) if indices else None
+        n = len(self.onsets)
+        deleted = {i for i in self._deleted_indices if 0 <= i < n}
+        selected = {i for i in self._selected_indices if 0 <= i < n}
+        if not deleted and not selected:
+            return None
+        if selected:
+            base = selected
+        else:
+            base = set(range(n))
+        result = base - deleted
+        return sorted(result) if result else None
 
     def _slice_to(self, output_dir: Path) -> list[Path]:
         """Génère les slices dans output_dir et retourne la liste de paths."""
@@ -859,9 +1187,11 @@ class SlicerView(ttk.Frame):
     # ── MIDI export ──────────────────────────────────────────────────────────
 
     def _generate_midi_temp(self) -> Optional[Path]:
-        """Génère un fichier .mid temp : 1 note par slice, chromatique C2+,
-        timestamps des onsets convertis en ticks à 120 BPM. Retourne le path
-        ou None si pas de slices."""
+        """Génère un fichier .mid temp : 1 note par slice, chromatique C2+.
+
+        Le tempo BPM est calculé pour que la durée totale du sample = N beats
+        (où N est lu depuis self.beats_var). Comme ça le DAW aligne les notes
+        sur sa grille de beats à l'import."""
         if not MIDI_AVAILABLE:
             self.status.config(text="MIDI export unavailable (mido not installed)")
             return None
@@ -870,7 +1200,15 @@ class SlicerView(ttk.Frame):
             return None
 
         ppq = 480
-        bpm = 120
+        total_dur_sec = len(self.y_mono) / self.sr if self.sr else 0.0
+        try:
+            n_beats = max(1, int(self.beats_var.get()))
+        except (tk.TclError, ValueError):
+            n_beats = 16
+        if total_dur_sec > 0:
+            bpm = n_beats * 60.0 / total_dur_sec
+        else:
+            bpm = 120.0
         tempo = mido.bpm2tempo(bpm)  # microsec per beat
         # 1 second = bpm/60 beats = bpm/60 * ppq ticks
         sec_to_ticks = lambda s: int(round(s * bpm / 60 * ppq))
