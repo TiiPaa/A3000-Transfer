@@ -4,12 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project context
 
-Windows-only utility for transferring WAV samples to a Yamaha A3000/A4000/A5000 sampler over SCSI (SMDI). The repo holds **two parallel prototypes**:
+Windows-only utility for transferring WAV samples to a Yamaha A3000/A4000/A5000 sampler over SCSI (SMDI). The repo holds **three parallel implementations** :
 
-- `python/` — **active MVP**. Validates SPTI scanning and WAV input. Targets the fastest path to confirm device detection on Windows 11.
-- `src/` — earlier C# prototype kept as reference. Mirrors the Python design but is no longer the focus.
-
-Neither prototype implements the actual SMDI sample transfer yet. Both currently stop at "scan + WAV validation".
+- `python/` — **production app, fully functional**. GUI tkinter (Upload/Download/Slicer), worker UAC architecture, .exe PyInstaller, MIDI export with drag-out OLE, transient detection via librosa. Validated in lab on Yamaha A3000 hardware.
+- `rust/` — **port en cours** (workspace Cargo, 3 crates : core/onset/app). Rewrite parallèle, Python reste fonctionnel jusqu'à validation Rust bout-en-bout. Voir `docs/conversion/` pour la méthode + INVENTORY/MAPPING/DECISIONS + tests d'oracle bit-à-bit.
+- `src/` — earlier C# prototype kept as reference (legacy, no longer maintained).
 
 The text in `README.md` and `python/README.md` is in French — match that language when editing those files.
 
@@ -38,6 +37,24 @@ dotnet run --project src/A3000Transfer.Windows/A3000Transfer.Windows.csproj -- s
 ```
 
 Requires .NET 8 SDK. `A3000Transfer.Core` targets `net8.0`, `A3000Transfer.Windows` targets `net8.0-windows`.
+
+### Rust port (in progress)
+
+```powershell
+cd rust
+cargo build --release        # binaire unique ~25 MB cible
+cargo test --workspace       # tests unitaires + oracles bit-à-bit vs Python
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Phase 1 status :
+- ✅ `a3000-core::smdi` — codec SMDI complet, 15 tests passent, parité Python validée
+- 🚧 `a3000-core::wav` / `midi` / `scsi` / `transfer` — TODO
+- 🚧 `a3000-onset` — port librosa.onset_detect — TODO Phase 2
+- 🚧 `a3000-app` — GUI egui + worker UAC — TODO Phases 3-4
+
+Plan complet : `C:\Users\baboost\.claude\plans\peppy-zooming-knuth.md`
+Conversion docs : `docs/conversion/{INVENTORY,MAPPING,DECISIONS}.md`
 
 ## Architecture
 
