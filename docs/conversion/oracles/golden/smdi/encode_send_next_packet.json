@@ -1,0 +1,22 @@
+[
+  {
+    "packet_number": 0,
+    "expected_hex": "534d444901030000000003000000"
+  },
+  {
+    "packet_number": 1,
+    "expected_hex": "534d444901030000000003000001"
+  },
+  {
+    "packet_number": 100,
+    "expected_hex": "534d444901030000000003000064"
+  },
+  {
+    "packet_number": 65535,
+    "expected_hex": "534d44490103000000000300ffff"
+  },
+  {
+    "packet_number": 16777215,
+    "expected_hex": "534d444901030000000003ffffff"
+  }
+]

@@ -1,0 +1,45 @@
+[package]
+name = "a3000-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+default-run = "a3000-transfer"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "a3000-transfer"
+path = "src/main.rs"
+
+[dependencies]
+a3000-core = { path = "../a3000-core" }
+a3000-onset = { path = "../a3000-onset" }
+
+# GUI
+egui = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+
+# Audio playback
+cpal.workspace = true
+hound.workspace = true
+
+# CLI / IPC / config
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Erreurs / logging
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Tempfiles pour MIDI drag-out
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[build-dependencies]
+# Embed icon ressource Windows
+winres = "0.1"

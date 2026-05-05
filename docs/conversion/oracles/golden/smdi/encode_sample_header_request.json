@@ -1,0 +1,30 @@
+[
+  {
+    "sample_number": 0,
+    "expected_hex": "534d444901200000000003000000"
+  },
+  {
+    "sample_number": 1,
+    "expected_hex": "534d444901200000000003000001"
+  },
+  {
+    "sample_number": 7,
+    "expected_hex": "534d444901200000000003000007"
+  },
+  {
+    "sample_number": 100,
+    "expected_hex": "534d444901200000000003000064"
+  },
+  {
+    "sample_number": 300,
+    "expected_hex": "534d44490120000000000300012c"
+  },
+  {
+    "sample_number": 1023,
+    "expected_hex": "534d4449012000000000030003ff"
+  },
+  {
+    "sample_number": 65535,
+    "expected_hex": "534d44490120000000000300ffff"
+  }
+]

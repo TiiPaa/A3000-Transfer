@@ -1,0 +1,39 @@
+[package]
+name = "a3000-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Audio I/O
+symphonia.workspace = true
+hound.workspace = true
+
+# DSP / arrays
+ndarray.workspace = true
+
+# Random (reproductible vs Python pour le TPDF dither)
+mt19937.workspace = true
+
+# MIDI
+midly.workspace = true
+
+# Erreurs typées
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Sérialisation
+serde.workspace = true
+
+# Win32 (SCSI IOCTL — Windows uniquement)
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

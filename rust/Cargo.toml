@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/a3000-core",
+    "crates/a3000-onset",
+    "crates/a3000-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["TiiPaa"]
+license = "MIT"
+repository = "https://github.com/TiiPaa/A3000-Transfer"
+
+# Lint global : strict pour catcher les anti-patterns Python→Rust
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# pedantic désactivé : trop bruyant sur ce projet (casts de bytes BE volontaires,
+# documentation détaillée pas critique pour binaire interne, etc.)
+# Garde-fous opinionated maintenus en code prod (auto-désactivés dans #[cfg(test)]) :
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Dependencies partagées (versions épinglées pour reproductibilité)
+[workspace.dependencies]
+# Audio
+symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm"] }
+hound = "3.5"
+cpal = "0.15"
+# DSP
+rustfft = "6.2"
+ndarray = "0.15"
+ndarray-stats = "0.5"
+# MIDI
+midly = "0.5"
+# Sérialisation / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Erreurs / logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Random (mt19937 pour reproductibilité TPDF dither vs Python)
+mt19937 = "3"
+# Win32
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+] }
+# Tests
+tempfile = "3"

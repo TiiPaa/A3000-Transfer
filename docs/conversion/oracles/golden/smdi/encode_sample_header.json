@@ -1,0 +1,34 @@
+[
+  {
+    "input": {
+      "sample_number": 100,
+      "bits_per_word": 16,
+      "channels": 1,
+      "sample_period_ns": 22675,
+      "sample_length_words": 44100,
+      "loop_start": 0,
+      "loop_end": 44100,
+      "loop_control": 0,
+      "pitch_integer": 60,
+      "pitch_fraction": 0,
+      "name": "test_sample"
+    },
+    "expected_hex": "534d44490121000000002500006410010058930000ac44000000000000ac44003c0000000b746573745f73616d706c65"
+  },
+  {
+    "input": {
+      "sample_number": 300,
+      "bits_per_word": 16,
+      "channels": 2,
+      "sample_period_ns": 20833,
+      "sample_length_words": 159784,
+      "loop_start": 12345,
+      "loop_end": 159784,
+      "loop_control": 1,
+      "pitch_integer": 64,
+      "pitch_fraction": 12345,
+      "name": "loop01"
+    },
+    "expected_hex": "534d44490121000000002000012c10020051610002702800003039000270280140003039066c6f6f703031"
+  }
+]

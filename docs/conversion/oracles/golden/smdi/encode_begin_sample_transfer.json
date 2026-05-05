@@ -1,0 +1,22 @@
+[
+  {
+    "sample_number": 0,
+    "data_packet_length": 4096,
+    "expected_hex": "534d444901220000000006000000001000"
+  },
+  {
+    "sample_number": 100,
+    "data_packet_length": 8192,
+    "expected_hex": "534d444901220000000006000064002000"
+  },
+  {
+    "sample_number": 1023,
+    "data_packet_length": 1024,
+    "expected_hex": "534d4449012200000000060003ff000400"
+  },
+  {
+    "sample_number": 65535,
+    "data_packet_length": 16384,
+    "expected_hex": "534d44490122000000000600ffff004000"
+  }
+]
