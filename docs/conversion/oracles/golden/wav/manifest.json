@@ -1,0 +1,148 @@
+{
+  "cases": [
+    {
+      "input_filename": "silence_mono_16_44100.wav",
+      "subtype": "PCM_16",
+      "expected_metadata": {
+        "channels": 1,
+        "sample_rate": 44100,
+        "bits_per_sample": 16,
+        "frame_count": 1024,
+        "byte_count": 2048,
+        "duration_s": 0.023219954648526078
+      },
+      "pcm16_filename": "silence_mono_16_44100.pcm16",
+      "pcm16_byte_count": 2048,
+      "no_dither_filename": null,
+      "oracle_strategy": "exact"
+    },
+    {
+      "input_filename": "silence_stereo_16_44100.wav",
+      "subtype": "PCM_16",
+      "expected_metadata": {
+        "channels": 2,
+        "sample_rate": 44100,
+        "bits_per_sample": 16,
+        "frame_count": 1024,
+        "byte_count": 4096,
+        "duration_s": 0.023219954648526078
+      },
+      "pcm16_filename": "silence_stereo_16_44100.pcm16",
+      "pcm16_byte_count": 4096,
+      "no_dither_filename": null,
+      "oracle_strategy": "exact"
+    },
+    {
+      "input_filename": "sine_440_mono_16_44100.wav",
+      "subtype": "PCM_16",
+      "expected_metadata": {
+        "channels": 1,
+        "sample_rate": 44100,
+        "bits_per_sample": 16,
+        "frame_count": 4410,
+        "byte_count": 8820,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_mono_16_44100.pcm16",
+      "pcm16_byte_count": 8820,
+      "no_dither_filename": null,
+      "oracle_strategy": "exact"
+    },
+    {
+      "input_filename": "sine_440_stereo_16_48000.wav",
+      "subtype": "PCM_16",
+      "expected_metadata": {
+        "channels": 2,
+        "sample_rate": 48000,
+        "bits_per_sample": 16,
+        "frame_count": 4800,
+        "byte_count": 19200,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_stereo_16_48000.pcm16",
+      "pcm16_byte_count": 19200,
+      "no_dither_filename": null,
+      "oracle_strategy": "exact"
+    },
+    {
+      "input_filename": "sine_440_mono_24_44100.wav",
+      "subtype": "PCM_24",
+      "expected_metadata": {
+        "channels": 1,
+        "sample_rate": 44100,
+        "bits_per_sample": 24,
+        "frame_count": 4410,
+        "byte_count": 8820,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_mono_24_44100.pcm16",
+      "pcm16_byte_count": 8820,
+      "no_dither_filename": "sine_440_mono_24_44100.no_dither.pcm16",
+      "oracle_strategy": "tolerance_1_lsb_vs_no_dither"
+    },
+    {
+      "input_filename": "sine_440_stereo_24_44100.wav",
+      "subtype": "PCM_24",
+      "expected_metadata": {
+        "channels": 2,
+        "sample_rate": 44100,
+        "bits_per_sample": 24,
+        "frame_count": 4410,
+        "byte_count": 17640,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_stereo_24_44100.pcm16",
+      "pcm16_byte_count": 17640,
+      "no_dither_filename": "sine_440_stereo_24_44100.no_dither.pcm16",
+      "oracle_strategy": "tolerance_1_lsb_vs_no_dither"
+    },
+    {
+      "input_filename": "sine_440_mono_32_44100.wav",
+      "subtype": "PCM_32",
+      "expected_metadata": {
+        "channels": 1,
+        "sample_rate": 44100,
+        "bits_per_sample": 32,
+        "frame_count": 4410,
+        "byte_count": 8820,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_mono_32_44100.pcm16",
+      "pcm16_byte_count": 8820,
+      "no_dither_filename": "sine_440_mono_32_44100.no_dither.pcm16",
+      "oracle_strategy": "tolerance_1_lsb_vs_no_dither"
+    },
+    {
+      "input_filename": "sine_440_stereo_32f_44100.wav",
+      "subtype": "FLOAT",
+      "expected_metadata": {
+        "channels": 2,
+        "sample_rate": 44100,
+        "bits_per_sample": 32,
+        "frame_count": 4410,
+        "byte_count": 17640,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_stereo_32f_44100.pcm16",
+      "pcm16_byte_count": 17640,
+      "no_dither_filename": "sine_440_stereo_32f_44100.no_dither.pcm16",
+      "oracle_strategy": "tolerance_1_lsb_vs_no_dither"
+    },
+    {
+      "input_filename": "sine_440_mono_8_44100.wav",
+      "subtype": "PCM_U8",
+      "expected_metadata": {
+        "channels": 1,
+        "sample_rate": 44100,
+        "bits_per_sample": 8,
+        "frame_count": 4410,
+        "byte_count": 8820,
+        "duration_s": 0.1
+      },
+      "pcm16_filename": "sine_440_mono_8_44100.pcm16",
+      "pcm16_byte_count": 8820,
+      "no_dither_filename": "sine_440_mono_8_44100.no_dither.pcm16",
+      "oracle_strategy": "tolerance_1_lsb_vs_no_dither"
+    }
+  ]
+}

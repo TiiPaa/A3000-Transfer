@@ -51,8 +51,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI
 clap = { version = "4", features = ["derive"] }
-# Random (mt19937 pour reproductibilité TPDF dither vs Python)
-mt19937 = "3"
+# Random (ChaCha8 pour TPDF dither rapide ; pas bit-exact vs NumPy mais
+# tolérance ±1 LSB suffit pour audio — cf. DECISIONS.md)
+rand = "0.8"
+rand_chacha = "0.3"
 # Win32
 windows = { version = "0.58", features = [
     "Win32_Foundation",

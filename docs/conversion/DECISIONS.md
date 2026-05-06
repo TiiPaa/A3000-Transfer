@@ -49,12 +49,15 @@ Rust **diverge intentionnellement** de l'implémentation Python source. Sert à 
 **Impact** : ~700 LOC Rust à écrire et tester, mais aucun .so/.dll C à packager
 **Alternative envisagée** : `aubio-rs` pour MVP rapide. Rejetée car le test A/B vs Python échouerait probablement
 
-### `wav` — `mt19937` Rust crate pour TPDF dither reproductible
-**Source (Python)** : `random.Random()` (Mersenne Twister, seed implicite timestamp)
-**Cible (Rust)** : crate `mt19937` (Mersenne Twister 19937) avec seed fixe pour les tests, seed time-based en runtime
-**Pourquoi** : reproductibilité oracle. Comparer bytes Python ↔ Rust nécessite le même PRNG bit-à-bit
-**Impact** : le dither produit est identique au Python pour des seeds identiques. En runtime user-facing aucun impact perceptible (le dither est ±1 LSB)
-**Alternative envisagée** : ChaCha8 (PRNG cryptographique rapide). Rejetée pour la reproductibilité oracle. ChaCha pourrait être ré-évalué après que le port soit validé
+### `wav` — Oracle dithered : tolérance ±1 LSB au lieu de bit-à-bit
+**Source (Python)** : `np.random.default_rng()` (PCG64 de NumPy avec seed time-based)
+**Cible (Rust)** : `rand` + PRNG quelconque (probablement `rand_pcg` PCG64 ou `rand_chacha` ChaCha8) avec seed time-based également
+**Pourquoi** : matcher PCG64 NumPy bit-à-bit nécessiterait de répliquer le `BitGenerator` interne de NumPy (état 128-bit + spécifique transform), instable entre versions NumPy. Le dither est psycho-acoustique (±1 LSB), seul le caractère TPDF (somme de 2 uniformes) compte
+**Oracle stratégie** :
+- Path PCM_16 (pas de dither) : **bit-à-bit Python ↔ Rust**
+- Path dithered (8/24/32 int + 32 float) : **tolérance |rust - python_sans_dither| ≤ 1** sur chaque échantillon, où python_sans_dither = round(float * 32767). Ça vérifie que le dither est bien borné ±1 LSB sans imposer un PRNG identique
+**Impact** : on prouve équivalence sémantique (TPDF correct, range [-32768, 32767], pas de clipping silencieux), pas équivalence cryptographique. C'est suffisant pour un sampler audio
+**Alternative envisagée** : implémenter PCG64 NumPy en Rust. Rejetée car instable entre versions NumPy
 
 ### `gui` — Persistance config compatible avec Python
 **Source (Python)** : `%APPDATA%/a3000_transfer/config.json` avec `{"ha", "bus", "target", "lun"}`

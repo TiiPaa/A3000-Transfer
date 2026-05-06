@@ -186,15 +186,99 @@ def capture_smdi() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def capture_wav() -> None:
+    """Capture peek_wave_metadata + load_wave (path PCM_16 uniquement bit-à-bit).
+
+    Pour les paths dithered, on capture pour information mais le test Rust
+    utilisera une tolérance ±1 LSB (cf. DECISIONS.md).
+    """
+    import numpy as np
+    import soundfile as sf
+
+    from a3000_transfer.wav_reader import peek_wave_metadata, load_wave
+
     out = GOLDEN / "wav"
     out.mkdir(parents=True, exist_ok=True)
     inputs = HERE / "inputs" / "wavs"
     inputs.mkdir(parents=True, exist_ok=True)
 
-    # TODO Phase 1 : générer WAVs de test (mono/stéréo, 8/16/24/32-bit, float)
-    # avec contenus déterministes (sine + impulse), puis appeler peek_wave_metadata
-    # et load_wave (avec random.seed(42) avant) et dump bytes PCM attendus.
-    print(f"[wav] TODO — placeholder. Inputs WAVs à générer dans {inputs}")
+    # Génère un set de WAV de test avec contenu déterministe
+    cases_def = [
+        # (filename, channels, sample_rate, frames, subtype)
+        ("silence_mono_16_44100.wav",   1, 44100, 1024, "PCM_16"),
+        ("silence_stereo_16_44100.wav", 2, 44100, 1024, "PCM_16"),
+        ("sine_440_mono_16_44100.wav",  1, 44100, 4410, "PCM_16"),
+        ("sine_440_stereo_16_48000.wav", 2, 48000, 4800, "PCM_16"),
+        ("sine_440_mono_24_44100.wav",  1, 44100, 4410, "PCM_24"),
+        ("sine_440_stereo_24_44100.wav", 2, 44100, 4410, "PCM_24"),
+        ("sine_440_mono_32_44100.wav",  1, 44100, 4410, "PCM_32"),
+        ("sine_440_stereo_32f_44100.wav", 2, 44100, 4410, "FLOAT"),
+        ("sine_440_mono_8_44100.wav",   1, 44100, 4410, "PCM_U8"),
+    ]
+
+    manifest = {"cases": []}
+    for name, ch, sr, frames, subtype in cases_def:
+        path = inputs / name
+        # Génère le contenu : silence si nom contient "silence", sine 440 Hz sinon
+        t = np.arange(frames) / sr
+        if "silence" in name:
+            wave_data = np.zeros((frames, ch), dtype=np.float64)
+        else:
+            sine = 0.5 * np.sin(2 * np.pi * 440.0 * t)
+            wave_data = np.tile(sine[:, None], (1, ch))
+        # Conversion vers le subtype voulu
+        if subtype == "FLOAT":
+            data = wave_data.astype(np.float32)
+        elif subtype == "PCM_U8":
+            # 8-bit unsigned : soundfile veut int16 + subtype="PCM_U8" pour write
+            data = (wave_data * 32767).astype(np.int16)
+        elif subtype == "PCM_16":
+            data = (wave_data * 32767).astype(np.int16)
+        elif subtype == "PCM_24":
+            data = (wave_data * 8388607).astype(np.int32)  # soundfile gère 24-bit depuis int32
+        elif subtype == "PCM_32":
+            data = (wave_data * 2147483647).astype(np.int32)
+        else:
+            raise ValueError(f"unknown subtype {subtype}")
+        sf.write(str(path), data, sr, subtype=subtype)
+
+        # Capture peek_wave_metadata
+        meta = peek_wave_metadata(path)
+        meta_dict = {
+            "channels": meta.channels,
+            "sample_rate": meta.sample_rate,
+            "bits_per_sample": meta.bits_per_sample,
+            "frame_count": meta.frame_count,
+            "byte_count": meta.byte_count,
+            "duration_s": meta.duration_s,
+        }
+        # Capture load_wave PCM 16-bit LE bytes (avec dither, pour info)
+        wave_payload = load_wave(path)
+        pcm_bin = out / f"{path.stem}.pcm16"
+        pcm_bin.write_bytes(wave_payload.pcm_data)
+
+        # Pour les paths dithered, on stocke aussi la version SANS dither
+        # (round simple de float×32767). Le test Rust check |rust - no_dither| ≤ 1,
+        # le dither ne peut que rajouter ±1 LSB à round(float×32767).
+        if subtype != "PCM_16":
+            data_f32, _ = sf.read(str(path), dtype="float32", always_2d=True)
+            no_dither = np.clip(data_f32 * 32767.0, -32768.0, 32767.0).astype(np.int16)
+            pcm_bin_nd = out / f"{path.stem}.no_dither.pcm16"
+            pcm_bin_nd.write_bytes(no_dither.tobytes())
+        else:
+            pcm_bin_nd = None
+
+        manifest["cases"].append({
+            "input_filename": name,
+            "subtype": subtype,
+            "expected_metadata": meta_dict,
+            "pcm16_filename": pcm_bin.name,
+            "pcm16_byte_count": len(wave_payload.pcm_data),
+            "no_dither_filename": pcm_bin_nd.name if pcm_bin_nd else None,
+            "oracle_strategy": "exact" if subtype == "PCM_16" else "tolerance_1_lsb_vs_no_dither",
+        })
+
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"[wav] wrote {len(cases_def)} WAVs in {inputs} + {out}/manifest.json")
 
 
 # ──────────────────────────────────────────────────────────────────────────

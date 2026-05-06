@@ -15,8 +15,9 @@ hound.workspace = true
 # DSP / arrays
 ndarray.workspace = true
 
-# Random (reproductible vs Python pour le TPDF dither)
-mt19937.workspace = true
+# Random pour TPDF dither (ChaCha8, cf. DECISIONS.md)
+rand.workspace = true
+rand_chacha.workspace = true
 
 # MIDI
 midly.workspace = true
