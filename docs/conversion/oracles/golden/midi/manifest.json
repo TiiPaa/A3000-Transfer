@@ -1,0 +1,81 @@
+{
+  "cases": [
+    {
+      "onsets": [
+        0,
+        22050,
+        44100
+      ],
+      "total_samples": 88200,
+      "sample_rate": 44100,
+      "n_beats": 4,
+      "track_name": "test_loop",
+      "midi_filename": "case_3_slices_4_beats.mid",
+      "midi_byte_count": 73
+    },
+    {
+      "onsets": [
+        0,
+        5000,
+        10000,
+        15000,
+        20000
+      ],
+      "total_samples": 25000,
+      "sample_rate": 22050,
+      "n_beats": 8,
+      "track_name": "drum_break",
+      "midi_filename": "case_5_slices_8_beats.mid",
+      "midi_byte_count": 92
+    },
+    {
+      "onsets": [
+        0
+      ],
+      "total_samples": 100000,
+      "sample_rate": 44100,
+      "n_beats": 16,
+      "track_name": "single_slice",
+      "midi_filename": "case_1_slice_16_beats.mid",
+      "midi_byte_count": 58
+    },
+    {
+      "onsets": [
+        0,
+        1000
+      ],
+      "total_samples": 0,
+      "sample_rate": 44100,
+      "n_beats": 16,
+      "track_name": "edge_zero_dur",
+      "midi_filename": "case_zero_dur.mid",
+      "midi_byte_count": 66
+    },
+    {
+      "onsets": [
+        0,
+        22050,
+        44100,
+        66150,
+        88200,
+        110250,
+        132300,
+        154350,
+        176400,
+        198450,
+        220500,
+        242550,
+        264600,
+        286650,
+        308700,
+        330750
+      ],
+      "total_samples": 352800,
+      "sample_rate": 44100,
+      "n_beats": 16,
+      "track_name": "drumloop16",
+      "midi_filename": "case_16_slices.mid",
+      "midi_byte_count": 191
+    }
+  ]
+}

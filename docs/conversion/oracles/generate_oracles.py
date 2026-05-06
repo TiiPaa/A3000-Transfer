@@ -286,11 +286,75 @@ def capture_wav() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def capture_midi() -> None:
+    """Capture bytes SMF générés selon la logique de _generate_midi_temp.
+
+    Reproduit ici la logique du slicer pour pouvoir feeder des fixtures
+    déterministes (onsets, sr, n_beats, track_name) sans dépendre de la GUI.
+    """
+    import mido
+
     out = GOLDEN / "midi"
     out.mkdir(parents=True, exist_ok=True)
-    # TODO Phase 1 : pour différents (onsets, sr, n_beats), appeler la logique
-    # de _generate_midi_temp et dump les bytes SMF attendus
-    print(f"[midi] TODO — placeholder. Capturer bytes SMF dans {out}")
+
+    # (onsets en samples, total_samples, sr, n_beats, track_name, output_filename)
+    cases = [
+        ([0, 22050, 44100], 88200, 44100, 4, "test_loop", "case_3_slices_4_beats.mid"),
+        ([0, 5000, 10000, 15000, 20000], 25000, 22050, 8, "drum_break",
+         "case_5_slices_8_beats.mid"),
+        ([0], 100000, 44100, 16, "single_slice", "case_1_slice_16_beats.mid"),
+        # Edge case : total_samples=0 → BPM fallback 120
+        ([0, 1000], 0, 44100, 16, "edge_zero_dur", "case_zero_dur.mid"),
+        # Cas A3000 typique : 16 slices de drum break à 120 BPM (16 beats sur 8s)
+        ([i * 22050 for i in range(16)], 16 * 22050, 44100, 16, "drumloop16",
+         "case_16_slices.mid"),
+    ]
+
+    manifest = {"cases": []}
+    for onsets, total_samples, sr, n_beats, track_name, fname in cases:
+        ppq = 480
+        total_dur_sec = total_samples / sr if total_samples > 0 else 0.0
+        bpm = (n_beats * 60.0 / total_dur_sec) if total_dur_sec > 0 else 120.0
+        tempo = mido.bpm2tempo(bpm)
+
+        def sec_to_ticks(s: float) -> int:
+            return int(round(s * bpm / 60 * ppq))
+
+        mid = mido.MidiFile(ticks_per_beat=ppq)
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+        track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+        track.append(mido.MetaMessage("track_name", name=track_name[:32], time=0))
+
+        base_note = 36
+        last_tick = 0
+        for i, onset in enumerate(onsets):
+            start_sec = float(onset) / sr
+            end_sample = onsets[i + 1] if i + 1 < len(onsets) else total_samples
+            end_sec = float(end_sample) / sr
+            start_tick = sec_to_ticks(start_sec)
+            end_tick = sec_to_ticks(end_sec)
+            note = min(127, base_note + i)
+            delta_on = max(0, start_tick - last_tick)
+            delta_off = max(1, end_tick - start_tick)
+            track.append(mido.Message("note_on", note=note, velocity=100, time=delta_on))
+            track.append(mido.Message("note_off", note=note, velocity=0, time=delta_off))
+            last_tick = end_tick
+
+        path = out / fname
+        mid.save(str(path))
+
+        manifest["cases"].append({
+            "onsets": onsets,
+            "total_samples": total_samples,
+            "sample_rate": sr,
+            "n_beats": n_beats,
+            "track_name": track_name,
+            "midi_filename": fname,
+            "midi_byte_count": path.stat().st_size,
+        })
+
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"[midi] wrote {len(cases)} MIDI fixtures in {out}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
