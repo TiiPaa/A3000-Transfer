@@ -108,7 +108,7 @@ pub fn pcm16_be_to_le(pcm: &[u8]) -> Result<Vec<u8>, TransferError> {
 }
 
 /// Envoie un message SMDI complet via SCSI SEND.
-fn send_smdi(
+pub fn send_smdi(
     handle: &ScsiHandle,
     target: ScsiTarget,
     message: &[u8],
@@ -123,7 +123,7 @@ fn send_smdi(
 
 /// Lit un message SMDI via SCSI RECEIVE et le décode. Boucle sur Wait
 /// (slave demande plus de temps) et retry sur sense key 0x0B (ABORTED COMMAND).
-fn receive_smdi(
+pub fn receive_smdi(
     handle: &ScsiHandle,
     target: ScsiTarget,
     allocation_length: u32,
@@ -567,6 +567,110 @@ pub fn receive_sample(
     }
 
     Ok((header, received))
+}
+
+/// Lit le Sample Header d'un slot, ou retourne `None` si le slot est vide.
+///
+/// Reproduit `is_sample_slot_occupied` côté Python : un slot vide se
+/// manifeste soit par sense 0x81 (`NoReplyPending`), soit par un Reject
+/// `(0x0020, 0x0002)`.
+///
+/// # Errors
+/// Toute erreur SCSI/SMDI hors "slot vide" remonte (Rejected hors 0x0020/0x0002,
+/// UnexpectedReply, etc.).
+pub fn query_sample_header(
+    handle: &ScsiHandle,
+    target: ScsiTarget,
+    sample_number: u32,
+) -> Result<Option<SampleHeader>, TransferError> {
+    send_smdi(
+        handle, target,
+        &encode_sample_header_request(sample_number)?,
+        DEFAULT_TIMEOUT_S,
+    )?;
+    let recv = receive_smdi(handle, target, 4096, DEFAULT_TIMEOUT_S);
+    match recv {
+        Err(TransferError::Smdi(SmdiError::NoReplyPending)) => Ok(None),
+        Err(e) => Err(e),
+        Ok((_, reply)) => {
+            if reply.code() == MSG_REJECT {
+                let (code, sub) = decode_message_reject(&reply)?;
+                if (code, sub) == (0x0020, 0x0002) {
+                    return Ok(None);
+                }
+                return Err(TransferError::Rejected { code, sub });
+            }
+            if reply.code() != MSG_SAMPLE_HEADER {
+                return Err(TransferError::UnexpectedReply {
+                    id: reply.message_id, sub: reply.sub_id,
+                });
+            }
+            Ok(Some(decode_sample_header(&reply)?))
+        }
+    }
+}
+
+/// Scanne les slots à partir de `start` et retourne le 1er libre.
+///
+/// `start=7` par défaut côté Python (slots 0..6 sont des samples factory ROM
+/// sur A3000). `limit=256` plafond raisonnable.
+///
+/// # Errors
+/// `Internal("aucun slot libre")` si tous occupés dans la plage.
+pub fn find_first_free_sample(
+    handle: &ScsiHandle,
+    target: ScsiTarget,
+    start: u32,
+    limit: u32,
+) -> Result<u32, TransferError> {
+    for n in start..start + limit {
+        if query_sample_header(handle, target, n)?.is_none() {
+            return Ok(n);
+        }
+    }
+    Err(TransferError::Internal(format!(
+        "Aucun slot libre dans {start}..{}.", start + limit - 1,
+    )))
+}
+
+/// Sauvegarde un sample SMDI (PCM 16-bit BE interleaved) en fichier WAV
+/// PCM 16-bit LE via `hound`.
+///
+/// # Errors
+/// `UnsupportedWav` si bits_per_word ≠ 16, ou erreur d'écriture WAV.
+pub fn save_smdi_to_wav(
+    path: &std::path::Path,
+    header: &SampleHeader,
+    smdi_data: &[u8],
+) -> Result<(), TransferError> {
+    if header.bits_per_word != 16 {
+        return Err(TransferError::UnsupportedWav(format!(
+            "Export WAV : seul 16-bit supporté ({} reçus)",
+            header.bits_per_word,
+        )));
+    }
+    let le = pcm16_be_to_le(smdi_data)?;
+    let sample_rate = if header.sample_period_ns != 0 {
+        ((1_000_000_000.0 / header.sample_period_ns as f64).round()) as u32
+    } else {
+        44100
+    };
+    let spec = hound::WavSpec {
+        channels: header.channels.into(),
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|e| TransferError::Internal(format!("hound create: {e}")))?;
+    for chunk in le.chunks_exact(2) {
+        let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+        writer.write_sample(s)
+            .map_err(|e| TransferError::Internal(format!("hound write: {e}")))?;
+    }
+    writer.finalize()
+        .map_err(|e| TransferError::Internal(format!("hound finalize: {e}")))?;
+    Ok(())
 }
 
 #[cfg(test)]

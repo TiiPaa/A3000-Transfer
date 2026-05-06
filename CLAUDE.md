@@ -50,7 +50,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 Status :
 - ✅ Phase 1 — `a3000-core` complet (`smdi` / `wav` / `midi` / `scsi` / `transfer`), oracles bit-à-bit Python, validé bout-en-bout sur Yamaha A3000 réel
 - ✅ Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT/Mel/flux/peak/backtrack + wrapper engine.py:detect_transients). 17 tests passent. A/B vs Python : 150/150 onsets matched ≤1 frame (100%) sur 5 WAVs (synthétique + 3 drum loops + reese).
-- 🚧 Phase 3 — `a3000-app` : GUI egui + worker UAC + tabs Upload/Download — TODO
+- 🚧 Phase 3 — `a3000-app` : scaffolding fait (eframe shell + 3 tabs + theme dark + IPC + worker process + UAC). Wiring Upload/Download au WorkerClient + tables détaillées = TODO.
 - 🚧 Phase 4 — Slicer egui + drag-out OLE MIDI — TODO
 - 🚧 Phase 5 — Polish + design + packaging — TODO
 
