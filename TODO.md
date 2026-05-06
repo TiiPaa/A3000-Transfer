@@ -3,8 +3,9 @@
 ## Court terme (En cours)
 - [x] Rust Phase 1 — `a3000-core::wav.rs` : port wav_reader.py + oracles (bit-à-bit PCM_16, tolérance ±1 LSB dithered)
 - [x] Rust Phase 1 — `a3000-core::midi.rs` : port _generate_midi_temp + oracles bit-à-bit
-- [ ] **REPRENDRE ICI** Rust Phase 1 — `a3000-core::scsi.rs` : port scsi_passthrough.py via windows crate (RAII handle)
-- [ ] Rust Phase 1 — `a3000-core::transfer.rs` : port transfer.py (orchestrateur SMDI)
+- [x] Rust Phase 1 — `a3000-core::scsi.rs` : port scsi_passthrough.py via windows crate (RAII handle, retry ERROR_IO_DEVICE, buffer 512-aligned)
+- [ ] **REPRENDRE ICI** Rust Phase 1 — `a3000-core::transfer.rs` : port transfer.py (orchestrateur SMDI)
+- [ ] Test bout-en-bout Rust scan/identify/transfer sur Yamaha A3000 réel
 
 ## Moyen terme (Sprint)
 - [ ] Rust Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT + Mel + flux + peak + backtrack)
