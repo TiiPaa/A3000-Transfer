@@ -2,22 +2,24 @@
 //! gère l'envoi des Cmd et la réception des Event.
 //!
 //! Architecture :
-//!  - GUI (non-élevée) appelle `WorkerClient::start()` qui :
+//!  - `WorkerHandle::start()` :
 //!     1. Crée un `TcpListener` sur 127.0.0.1:0 (port éphémère).
 //!     2. Lance le worker via `ShellExecuteExW` avec verb=`runas`
 //!        (déclenche l'UAC) et `--worker --port N`.
-//!     3. Accepte la connexion entrante, attend `{"event":"ready"}`.
-//!  - Ensuite, `send_cmd` / `recv_event` parlent ce protocol JSON line.
-//!  - `stop()` envoie `{"cmd":"exit"}` et ferme tout.
+//!     3. Accepte la connexion entrante, lit `{"event":"ready"}`.
+//!     4. Spawn un thread reader qui lit le BufReader<TcpStream> en boucle
+//!        et pousse chaque Event dans un `mpsc::Sender<Event>`.
+//!  - `WorkerSender::send_cmd(&Cmd)` est cloneable et thread-safe : prend
+//!    le mutex du writer, sérialise, envoie une ligne JSON.
+//!  - `Drop` du handle : ferme la socket et terminate le process si encore vivant.
 //!
-//! Port direct de `python/a3000_transfer/gui.py:WorkerClient`.
+//! Port direct de `python/a3000_transfer/gui.py:WorkerClient`, threadé proprement.
 
 #![cfg(windows)]
-#![allow(dead_code)] // wiring vers app.rs viendra en Phase 3 plus tardive
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use windows::core::PCWSTR;
@@ -48,28 +50,46 @@ pub enum WorkerError {
 
 pub type Result<T> = std::result::Result<T, WorkerError>;
 
-/// Client RAII : connexion socket + handle process worker.
-pub struct WorkerClient {
-    /// Le stream connecté au worker. `None` après `stop`.
-    stream: Option<Arc<Mutex<TcpStream>>>,
-    /// Reader bufferisé sur un clone du stream (events arrivent ligne par ligne).
-    reader: Option<BufReader<TcpStream>>,
-    /// Process handle du worker (Windows). Fermé dans Drop.
+/// Côté envoi (cloneable pour réutilisation depuis plusieurs threads).
+#[derive(Clone)]
+pub struct WorkerSender {
+    stream: Arc<Mutex<TcpStream>>,
+}
+
+impl WorkerSender {
+    pub fn send_cmd(&self, cmd: &Cmd) -> Result<()> {
+        let guard = self.stream.lock().map_err(|_| WorkerError::NotConnected)?;
+        let mut s = guard.try_clone()?;
+        drop(guard);
+        let line = serde_json::to_string(cmd)?;
+        s.write_all(line.as_bytes())?;
+        s.write_all(b"\n")?;
+        s.flush()?;
+        Ok(())
+    }
+}
+
+/// Handle complet : sender + receiver d'events + process Win32.
+pub struct WorkerHandle {
+    pub sender: WorkerSender,
+    pub events: mpsc::Receiver<Event>,
     process: Option<HANDLE>,
 }
 
-impl WorkerClient {
-    /// Lance le worker élevé et attend qu'il dise `ready`.
+// SAFETY : HANDLE est juste un usize wrapper (pointeur opaque) ; le Win32
+// API garantit que CloseHandle/TerminateProcess sont thread-safe.
+unsafe impl Send for WorkerHandle {}
+
+impl WorkerHandle {
+    /// Lance le worker élevé et attend le ready handshake. Démarre aussi
+    /// le thread reader qui pousse les Events suivants dans le channel.
     pub fn start(connect_timeout: Duration) -> Result<Self> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
-        listener.set_nonblocking(false)?;
 
         let process = launch_worker_elevated(port)?;
 
-        // accept(...) bloque mais TcpListener n'a pas de timeout. On utilise
-        // set_nonblocking + poll, ou on triche en mettant un read_timeout
-        // après accept.
+        // accept(...) bloquant avec timeout via non-blocking poll.
         listener.set_nonblocking(true)?;
         let deadline = std::time::Instant::now() + connect_timeout;
         let stream = loop {
@@ -77,7 +97,6 @@ impl WorkerClient {
                 Ok((s, _)) => break s,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
-                        // Cleanup : termine le worker si lancé mais non-connecté.
                         if !process.is_invalid() {
                             unsafe { let _ = TerminateProcess(process, 1); }
                             unsafe { let _ = CloseHandle(process); }
@@ -90,12 +109,12 @@ impl WorkerClient {
             }
         };
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(None)?; // bloquant indéfiniment
+        stream.set_read_timeout(None)?;
 
-        let reader_stream = stream.try_clone()?;
-        let mut reader = BufReader::new(reader_stream);
+        let writer_stream = stream.try_clone()?;
+        let mut reader = BufReader::new(stream);
 
-        // Lit le premier event, doit être "ready".
+        // 1er event = ready.
         let mut line = String::new();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
@@ -106,61 +125,67 @@ impl WorkerClient {
             return Err(WorkerError::NoReady(Some(event)));
         }
 
+        // Thread reader : lit le reste indéfiniment, push dans le channel.
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        std::thread::Builder::new()
+            .name("worker-reader".into())
+            .spawn(move || {
+                let mut reader = reader;
+                loop {
+                    let mut line = String::new();
+                    let n = match reader.read_line(&mut line) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Event>(trimmed) {
+                        Ok(e) => {
+                            if event_tx.send(e).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            })?;
+
         Ok(Self {
-            stream: Some(Arc::new(Mutex::new(stream))),
-            reader: Some(reader),
+            sender: WorkerSender {
+                stream: Arc::new(Mutex::new(writer_stream)),
+            },
+            events: event_rx,
             process: Some(process),
         })
     }
 
-    /// Envoie une commande au worker (sérialisée en JSON line).
-    pub fn send_cmd(&mut self, cmd: &Cmd) -> Result<()> {
-        let stream = self.stream.as_ref().ok_or(WorkerError::NotConnected)?;
-        let mut s = stream.lock()
-            .map_err(|_| WorkerError::NotConnected)?
-            .try_clone()?;
-        let line = serde_json::to_string(cmd)?;
-        s.write_all(line.as_bytes())?;
-        s.write_all(b"\n")?;
-        s.flush()?;
-        Ok(())
+    /// Clone le sender (peut servir à partager l'envoi entre threads).
+    #[allow(dead_code)] // utilisé en Phase 3d.3 (Upload batch)
+    pub fn sender(&self) -> WorkerSender {
+        self.sender.clone()
     }
 
-    /// Lit le prochain event (bloque jusqu'à arrivée d'une ligne).
-    pub fn recv_event(&mut self) -> Result<Option<Event>> {
-        let reader = self.reader.as_mut().ok_or(WorkerError::NotConnected)?;
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::from_str(line.trim())?))
-    }
-
-    /// Envoie `exit` au worker, attend la sortie, ferme tout.
-    pub fn stop(&mut self) {
-        if let Some(stream) = self.stream.as_ref() {
-            if let Ok(guard) = stream.lock() {
-                if let Ok(mut s) = guard.try_clone() {
-                    let _ = serde_json::to_writer(&mut s, &Cmd::Exit);
-                    let _ = s.write_all(b"\n");
-                    let _ = s.flush();
-                }
-            }
-        }
-        self.stream = None;
-        self.reader = None;
+    /// Envoie `exit` au worker ; le reader thread sortira sur EOF.
+    pub fn shutdown(&mut self) {
+        let _ = self.sender.send_cmd(&Cmd::Exit);
         if let Some(p) = self.process.take() {
             if !p.is_invalid() {
+                // On ne TerminateProcess pas : `exit` cmd suffit en général,
+                // et on ne veut pas tuer le worker en plein milieu d'un IOCTL.
                 unsafe { let _ = CloseHandle(p); }
             }
         }
     }
 }
 
-impl Drop for WorkerClient {
+impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        self.stop();
+        self.shutdown();
     }
 }
 

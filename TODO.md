@@ -11,7 +11,11 @@
 - [x] Rust Phase 3a — Scaffolding GUI egui : eframe::App + 3 tabs vides + theme dark + IPC types Cmd/Event
 - [x] Rust Phase 3b — Worker process port _worker.py (TCP localhost JSON line, find_free_slot/list_samples/receive/transfer/exit)
 - [x] Rust Phase 3c — UAC elevation via ShellExecuteExW (WorkerClient bind port + spawn worker élevé + handshake "ready")
-- [ ] **REPRENDRE ICI** Rust Phase 3d — Wiring tabs Upload/Download au WorkerClient + table complète + drag-IN files/archives
+- [x] Rust Phase 3d.1 — WorkerClient lifecycle dans App (WorkerState Idle/Connecting/Connected/Error + bouton Connect)
+- [x] Rust Phase 3d.2 — Settings dialog modal HA/Bus/Target/LUN + auto/manual start slot
+- [x] Rust Phase 3d.3 — Upload tab : table colonnes + drag-IN WAV + batch via WorkerSender (FindFreeSlot → Transfer séquentiel + progress live)
+- [x] Rust Phase 3d.4 — Download tab : Scan → ListSamples → table samples + Download batch séquentiel
+- [ ] **REPRENDRE ICI** Bug UI : colonnes des tables Upload/Download décalées quand plusieurs items (set_min_size + allocate_ui_with_layout pas suffisants — investiguer egui_extras::TableBuilder ou allocate_exact_size + child_ui)
 
 ## Moyen terme (Sprint)
 - [ ] Rust Phase 4 — Slicer egui + custom waveform widget + drag-out OLE MIDI
