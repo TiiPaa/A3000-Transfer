@@ -6,11 +6,11 @@
 - [x] Rust Phase 1 — `a3000-core::scsi.rs` : port scsi_passthrough.py via windows crate (RAII handle, retry ERROR_IO_DEVICE, buffer 512-aligned)
 - [x] Rust Phase 1 — `a3000-core::transfer.rs` : port transfer.py (orchestrateur SMDI)
 - [x] Test bout-en-bout Rust scan/identify/transfer sur Yamaha A3000 réel (loop01.wav + RawCutz_*.wav OK sur slot 300)
-- [ ] **REPRENDRE ICI** Rust Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT + Mel + flux + peak + backtrack)
+- [x] Rust Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT + Mel + flux + peak + backtrack), 17 tests passent
+- [x] Rust Phase 2 — A/B test ≤1 frame tolérance vs librosa : **150/150 onsets matched (100%)** sur 5 WAVs (synthétique + 3 drum loops + reese)
+- [ ] **REPRENDRE ICI** Rust Phase 3 — Scaffolding GUI egui + worker UAC + tabs Upload/Download
 
 ## Moyen terme (Sprint)
-- [ ] Rust Phase 2 — A/B test automatisé tolérance ≤1 frame sur N WAVs de test
-- [ ] Rust Phase 3 — Scaffolding GUI egui + worker UAC + tabs Upload/Download
 - [ ] Rust Phase 4 — Slicer egui + custom waveform widget + drag-out OLE MIDI
 - [ ] Rust Phase 5 — Polish + design dark theme + packaging release
 

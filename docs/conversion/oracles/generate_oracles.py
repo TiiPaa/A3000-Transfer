@@ -362,11 +362,189 @@ def capture_midi() -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 def capture_onset() -> None:
+    """Capture les sorties librosa pour la pipeline onset detection.
+
+    Pour chaque cas (synthétique + drum loops réels), dumpe :
+      - y.f32        : input mono float32 LE (à feed verbatim depuis Rust)
+      - stft_mag.f32 : |S| magnitude, shape (n_freq, n_frames), row-major f32 LE
+      - mel.f32      : mel power spectrogram, shape (n_mels, n_frames)
+      - mel_db.f32   : power_to_db(mel), shape (n_mels, n_frames)
+      - onset_env.f32: librosa.onset.onset_strength(y, sr), shape (n_frames,)
+      - peaks.json          : peak_pick(env) indices de frames (sans backtrack)
+      - backtracked.json    : onset_backtrack(peaks, env) indices de frames
+      - onset_detect.json   : onset_detect(..., backtrack=True) indices de frames
+      - engine_samples.json : engine.py:detect_transients() indices de samples (final)
+
+    Tous les paramètres sont ceux par défaut au sr=44100 hop=512 (cf. plan).
+    """
+    import numpy as np
+    import soundfile as sf
+    import librosa
+
+    from a3000_transfer.slicer.engine import detect_transients
+
     out = GOLDEN / "onset"
     out.mkdir(parents=True, exist_ok=True)
-    # TODO Phase 2 : sur un set de WAVs de test (drum loops, samples vocaux),
-    # appeler detect_transients et dump les listes d'onset indices
-    print(f"[onset] TODO — placeholder. Lancer detect_transients sur N WAVs de test")
+    inputs = HERE / "inputs" / "wavs_onset"
+    inputs.mkdir(parents=True, exist_ok=True)
+
+    # ── Génère un cas synthétique : impulse train avec décroissance exponentielle.
+    # 4 transients à 0.0s / 0.25s / 0.5s / 0.75s sur 1.0s à 44100 Hz.
+    sr_synth = 44100
+    y_synth = np.zeros(sr_synth, dtype=np.float32)
+    for start in [0, 11025, 22050, 33075]:
+        n = min(2205, len(y_synth) - start)
+        decay = np.exp(-np.arange(n) / 1000.0).astype(np.float32)
+        y_synth[start:start + n] += decay
+    synth_path = inputs / "impulses_4_44100.wav"
+    sf.write(str(synth_path), y_synth, sr_synth, subtype="PCM_16")
+
+    # ── Cas réels (drum loops + reese du dossier python/samples).
+    repo_samples = ROOT / "python" / "samples"
+
+    cases = [
+        ("impulses_4_44100", synth_path),
+        ("loop01", repo_samples / "loop01.wav"),
+        ("loop02", repo_samples / "loop02.wav"),
+        ("loop03", repo_samples / "loop03.wav"),
+        ("reese02", repo_samples / "reese02.wav"),
+    ]
+
+    n_fft = 2048
+    hop_length = 512
+
+    manifest = {
+        "params": {
+            "n_fft": n_fft,
+            "hop_length": hop_length,
+            "n_mels": 128,
+            "fmin": 0.0,
+            "fmax_factor": 0.5,  # fmax = sr * 0.5
+            "power": 2.0,
+            "win": "hann_periodic",
+            "center": True,
+            "pad_mode": "constant",
+            "mel_norm": "slaney",
+            "mel_htk": False,
+            "power_to_db": {"ref": 1.0, "amin": 1e-10, "top_db": 80.0},
+            "onset_strength": {"lag": 1, "max_size": 1, "aggregate": "mean"},
+            "peak_pick_default": "0.03/0.00/0.10/0.10/0.03 sec → frames",
+            "delta_default": 0.07,
+            "engine": {"sensitivity": 1.0, "min_gap_ms": 30, "snap_ms": 50, "backtrack": True},
+        },
+        "cases": [],
+    }
+
+    for case_name, wav_path in cases:
+        # Load + mono float32 (même logique que slicer/engine.py)
+        audio, sr = sf.read(str(wav_path), always_2d=False)
+        if audio.ndim > 1:
+            y = librosa.to_mono(audio.T)
+        else:
+            y = audio
+        y = y.astype(np.float32)
+
+        case_dir = out / case_name
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        # Dump y verbatim
+        (case_dir / "y.f32").write_bytes(y.tobytes())
+
+        # Stage 1 : STFT magnitude
+        S = librosa.stft(y, n_fft=n_fft, hop_length=hop_length,
+                         window="hann", center=True, pad_mode="constant")
+        stft_mag = np.abs(S).astype(np.float32)
+        (case_dir / "stft_mag.f32").write_bytes(stft_mag.tobytes())
+
+        # Stage 2 : Mel power spectrogram (utilise S² en interne)
+        mel = librosa.feature.melspectrogram(
+            y=y, sr=sr, n_fft=n_fft, hop_length=hop_length,
+            n_mels=128, fmin=0.0, fmax=sr / 2, power=2.0,
+            window="hann", center=True, pad_mode="constant",
+        ).astype(np.float32)
+        (case_dir / "mel.f32").write_bytes(mel.tobytes())
+
+        # Stage 3 : power_to_db
+        mel_db = librosa.power_to_db(mel).astype(np.float32)
+        (case_dir / "mel_db.f32").write_bytes(mel_db.tobytes())
+
+        # Stage 4 : onset envelope
+        env = librosa.onset.onset_strength(
+            y=y, sr=sr, hop_length=hop_length, n_fft=n_fft,
+        ).astype(np.float32)
+        (case_dir / "onset_env.f32").write_bytes(env.tobytes())
+
+        # Stage 5 : peaks (sparse frame indices, paramètres librosa par défaut)
+        pre_max = max(1, int(0.03 * sr / hop_length))
+        post_max = max(1, int(0.00 * sr / hop_length) + 1)
+        pre_avg = max(1, int(0.10 * sr / hop_length))
+        post_avg = max(1, int(0.10 * sr / hop_length) + 1)
+        wait = max(1, int(0.03 * sr / hop_length))
+        delta = 0.07
+
+        # Note : librosa.onset_detect normalize=True par défaut :
+        #   env_n = (env - min(env)) / (max(env - min(env)) + tiny)
+        # puis peak_pick(env_n, ...).
+        from librosa.util import tiny as _ltiny
+        env_shifted = env - env.min()
+        env_normalized = env_shifted / (env_shifted.max() + _ltiny(env_shifted))
+        (case_dir / "onset_env_normalized.f32").write_bytes(
+            env_normalized.astype(np.float32).tobytes()
+        )
+        peaks = librosa.util.peak_pick(
+            env_normalized,
+            pre_max=pre_max, post_max=post_max,
+            pre_avg=pre_avg, post_avg=post_avg,
+            delta=delta, wait=wait,
+        )
+        (case_dir / "peaks.json").write_text(json.dumps(peaks.tolist()))
+
+        # Stage 6 : backtracked (utilise env normalized, comme onset_detect)
+        backtracked = librosa.onset.onset_backtrack(peaks, env_normalized)
+        (case_dir / "backtracked.json").write_text(json.dumps(backtracked.tolist()))
+
+        # Stage 7 : onset_detect (officiel, backtrack=True comme dans engine.py)
+        od_frames = librosa.onset.onset_detect(
+            y=y, sr=sr, hop_length=hop_length,
+            backtrack=True, delta=delta, units="frames",
+        )
+        (case_dir / "onset_detect.json").write_text(json.dumps(od_frames.tolist()))
+
+        # Stage 8 : engine.detect_transients (final API publique)
+        engine_samples = detect_transients(y, sr, sensitivity=1.0,
+                                           min_gap_ms=30, snap_ms=50,
+                                           hop_length=hop_length, backtrack=True)
+        (case_dir / "engine_samples.json").write_text(
+            json.dumps(engine_samples.tolist())
+        )
+
+        manifest["cases"].append({
+            "name": case_name,
+            "input_wav": str(wav_path.relative_to(ROOT)).replace("\\", "/"),
+            "sample_rate": int(sr),
+            "n_samples": int(len(y)),
+            "y_byte_count": len(y) * 4,
+            "stft_mag_shape": list(stft_mag.shape),
+            "mel_shape": list(mel.shape),
+            "mel_db_shape": list(mel_db.shape),
+            "onset_env_len": int(len(env)),
+            "peaks_count": int(len(peaks)),
+            "backtracked_count": int(len(backtracked)),
+            "onset_detect_count": int(len(od_frames)),
+            "engine_samples_count": int(len(engine_samples)),
+            "peak_pick_params": {
+                "pre_max": pre_max, "post_max": post_max,
+                "pre_avg": pre_avg, "post_avg": post_avg,
+                "delta": delta, "wait": wait,
+            },
+        })
+
+        print(f"[onset] {case_name}: {len(y)} samples ; "
+              f"env len={len(env)}, peaks={len(peaks)}, "
+              f"backtracked={len(backtracked)}, engine_samples={len(engine_samples)}")
+
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"[onset] wrote manifest + {len(cases)} fixture dirs to {out}")
 
 
 # ──────────────────────────────────────────────────────────────────────────

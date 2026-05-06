@@ -1,0 +1,195 @@
+{
+  "params": {
+    "n_fft": 2048,
+    "hop_length": 512,
+    "n_mels": 128,
+    "fmin": 0.0,
+    "fmax_factor": 0.5,
+    "power": 2.0,
+    "win": "hann_periodic",
+    "center": true,
+    "pad_mode": "constant",
+    "mel_norm": "slaney",
+    "mel_htk": false,
+    "power_to_db": {
+      "ref": 1.0,
+      "amin": 1e-10,
+      "top_db": 80.0
+    },
+    "onset_strength": {
+      "lag": 1,
+      "max_size": 1,
+      "aggregate": "mean"
+    },
+    "peak_pick_default": "0.03/0.00/0.10/0.10/0.03 sec \u2192 frames",
+    "delta_default": 0.07,
+    "engine": {
+      "sensitivity": 1.0,
+      "min_gap_ms": 30,
+      "snap_ms": 50,
+      "backtrack": true
+    }
+  },
+  "cases": [
+    {
+      "name": "impulses_4_44100",
+      "input_wav": "docs/conversion/oracles/inputs/wavs_onset/impulses_4_44100.wav",
+      "sample_rate": 44100,
+      "n_samples": 44100,
+      "y_byte_count": 176400,
+      "stft_mag_shape": [
+        1025,
+        87
+      ],
+      "mel_shape": [
+        128,
+        87
+      ],
+      "mel_db_shape": [
+        128,
+        87
+      ],
+      "onset_env_len": 87,
+      "peaks_count": 7,
+      "backtracked_count": 7,
+      "onset_detect_count": 7,
+      "engine_samples_count": 8,
+      "peak_pick_params": {
+        "pre_max": 2,
+        "post_max": 1,
+        "pre_avg": 8,
+        "post_avg": 9,
+        "delta": 0.07,
+        "wait": 2
+      }
+    },
+    {
+      "name": "loop01",
+      "input_wav": "python/samples/loop01.wav",
+      "sample_rate": 44100,
+      "n_samples": 159784,
+      "y_byte_count": 639136,
+      "stft_mag_shape": [
+        1025,
+        313
+      ],
+      "mel_shape": [
+        128,
+        313
+      ],
+      "mel_db_shape": [
+        128,
+        313
+      ],
+      "onset_env_len": 313,
+      "peaks_count": 13,
+      "backtracked_count": 13,
+      "onset_detect_count": 13,
+      "engine_samples_count": 13,
+      "peak_pick_params": {
+        "pre_max": 2,
+        "post_max": 1,
+        "pre_avg": 8,
+        "post_avg": 9,
+        "delta": 0.07,
+        "wait": 2
+      }
+    },
+    {
+      "name": "loop02",
+      "input_wav": "python/samples/loop02.wav",
+      "sample_rate": 44100,
+      "n_samples": 148826,
+      "y_byte_count": 595304,
+      "stft_mag_shape": [
+        1025,
+        291
+      ],
+      "mel_shape": [
+        128,
+        291
+      ],
+      "mel_db_shape": [
+        128,
+        291
+      ],
+      "onset_env_len": 291,
+      "peaks_count": 15,
+      "backtracked_count": 15,
+      "onset_detect_count": 15,
+      "engine_samples_count": 15,
+      "peak_pick_params": {
+        "pre_max": 2,
+        "post_max": 1,
+        "pre_avg": 8,
+        "post_avg": 9,
+        "delta": 0.07,
+        "wait": 2
+      }
+    },
+    {
+      "name": "loop03",
+      "input_wav": "python/samples/loop03.wav",
+      "sample_rate": 44100,
+      "n_samples": 166908,
+      "y_byte_count": 667632,
+      "stft_mag_shape": [
+        1025,
+        326
+      ],
+      "mel_shape": [
+        128,
+        326
+      ],
+      "mel_db_shape": [
+        128,
+        326
+      ],
+      "onset_env_len": 326,
+      "peaks_count": 16,
+      "backtracked_count": 16,
+      "onset_detect_count": 16,
+      "engine_samples_count": 16,
+      "peak_pick_params": {
+        "pre_max": 2,
+        "post_max": 1,
+        "pre_avg": 8,
+        "post_avg": 9,
+        "delta": 0.07,
+        "wait": 2
+      }
+    },
+    {
+      "name": "reese02",
+      "input_wav": "python/samples/reese02.wav",
+      "sample_rate": 44100,
+      "n_samples": 529200,
+      "y_byte_count": 2116800,
+      "stft_mag_shape": [
+        1025,
+        1034
+      ],
+      "mel_shape": [
+        128,
+        1034
+      ],
+      "mel_db_shape": [
+        128,
+        1034
+      ],
+      "onset_env_len": 1034,
+      "peaks_count": 101,
+      "backtracked_count": 101,
+      "onset_detect_count": 101,
+      "engine_samples_count": 98,
+      "peak_pick_params": {
+        "pre_max": 2,
+        "post_max": 1,
+        "pre_avg": 8,
+        "post_avg": 9,
+        "delta": 0.07,
+        "wait": 2
+      }
+    }
+  ]
+}

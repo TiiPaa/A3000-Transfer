@@ -47,11 +47,12 @@ cargo test --workspace       # tests unitaires + oracles bit-à-bit vs Python
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Phase 1 status :
-- ✅ `a3000-core::smdi` — codec SMDI complet, 15 tests passent, parité Python validée
-- 🚧 `a3000-core::wav` / `midi` / `scsi` / `transfer` — TODO
-- 🚧 `a3000-onset` — port librosa.onset_detect — TODO Phase 2
-- 🚧 `a3000-app` — GUI egui + worker UAC — TODO Phases 3-4
+Status :
+- ✅ Phase 1 — `a3000-core` complet (`smdi` / `wav` / `midi` / `scsi` / `transfer`), oracles bit-à-bit Python, validé bout-en-bout sur Yamaha A3000 réel
+- ✅ Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT/Mel/flux/peak/backtrack + wrapper engine.py:detect_transients). 17 tests passent. A/B vs Python : 150/150 onsets matched ≤1 frame (100%) sur 5 WAVs (synthétique + 3 drum loops + reese).
+- 🚧 Phase 3 — `a3000-app` : GUI egui + worker UAC + tabs Upload/Download — TODO
+- 🚧 Phase 4 — Slicer egui + drag-out OLE MIDI — TODO
+- 🚧 Phase 5 — Polish + design + packaging — TODO
 
 Plan complet : `C:\Users\baboost\.claude\plans\peppy-zooming-knuth.md`
 Conversion docs : `docs/conversion/{INVENTORY,MAPPING,DECISIONS}.md`
