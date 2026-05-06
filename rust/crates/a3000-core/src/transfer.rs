@@ -242,6 +242,9 @@ pub struct TransferOptions {
     pub timeout_seconds: u32,
     pub dry_run: bool,
     pub settle_seconds: f32,
+    /// Si `true`, skip le drain défensif au début. Économise 1 RECEIVE
+    /// (~50 ms) sur les transferts consécutifs dans une même session.
+    pub skip_initial_drain: bool,
 }
 
 impl Default for TransferOptions {
@@ -254,6 +257,7 @@ impl Default for TransferOptions {
             timeout_seconds: DEFAULT_TIMEOUT_S,
             dry_run: false,
             settle_seconds: 1.0,
+            skip_initial_drain: false,
         }
     }
 }
@@ -318,7 +322,9 @@ pub fn transfer_sample(
     // Wrapper pour propager les erreurs avec abort
     let run = |progress: &mut Option<ProgressFn<'_>>| -> Result<TransferStats, TransferError> {
         // 0. Drain défensif (ne bloque jamais)
-        let _ = drain_pending_reply(handle, target);
+        if !opts.skip_initial_drain {
+            let _ = drain_pending_reply(handle, target);
+        }
 
         // 1. SEND Sample Header → RECEIVE BSTA
         let sh_msg = encode_sample_header(&header)?;
