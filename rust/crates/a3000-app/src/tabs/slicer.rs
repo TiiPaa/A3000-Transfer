@@ -24,6 +24,7 @@ pub struct SlicerState {
 }
 
 pub fn show(ui: &mut egui::Ui, _state: &mut SlicerState) {
+    ui.add_space(6.0);
     ui.heading("Slicer");
     ui.add_space(4.0);
     ui.label(

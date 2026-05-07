@@ -36,8 +36,9 @@ pub struct DownloadState {
 }
 
 pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
+    ui.add_space(6.0);
     ui.heading("Download");
-    ui.add_space(2.0);
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
             "Scan les slots du sampler ; sélectionne les samples à récupérer.",
@@ -48,7 +49,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
     // Header : bouton Scan + progress + output dir
     ui.horizontal(|ui| {
         let busy = state.current_idx.is_some();
-        let scan_btn = egui::Button::new("Scan").fill(palette::BG_PANEL_LIGHT);
+        let scan_btn = egui::Button::new("Scan")
+            .fill(palette::BG_PANEL_LIGHT)
+            .min_size(egui::vec2(80.0, 32.0));
         if ui.add_enabled(!busy, scan_btn).clicked() {
             state.request_scan = true;
         }
@@ -88,7 +91,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
                                 else { format!("Download {} ▶", n_checked) };
                     let btn = egui::Button::new(
                         egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
-                    ).fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN });
+                    )
+                    .fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN })
+                    .min_size(egui::vec2(140.0, 32.0));
                     if ui.add_enabled(dl_enabled, btn).clicked() {
                         state.request_download = true;
                     }
@@ -109,7 +114,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
     }
 }
 
-const ROW_H: f32 = 22.0;
+const ROW_H: f32 = 28.0;
 const COL_CHECK: f32 = 28.0;
 const COL_SLOT: f32 = 60.0;
 const COL_NAME: f32 = 220.0;

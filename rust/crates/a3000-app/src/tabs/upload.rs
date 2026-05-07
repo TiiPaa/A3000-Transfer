@@ -192,8 +192,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut UploadState, config: &Config) {
         state.add_path(p);
     }
 
+    ui.add_space(6.0);
     ui.heading("Upload");
-    ui.add_space(2.0);
+    ui.add_space(4.0);
     ui.label(
         egui::RichText::new(format!(
             "Drag des WAV pour les ajouter à la queue. Slot de départ : {}",
@@ -242,7 +243,8 @@ fn empty_drop_zone(ui: &mut egui::Ui) {
 }
 
 // Largeurs de colonnes (px) — partagées header + rows pour alignement strict.
-const ROW_H: f32 = 22.0;
+// Hauteur de ligne ≥ interact_size (24) + 4 px de respiration verticale.
+const ROW_H: f32 = 28.0;
 const COL_CHECK: f32 = 28.0;
 const COL_FILE: f32 = 200.0;
 const COL_NAME: f32 = 140.0;
@@ -358,7 +360,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                         .desired_width(COL_PROGRESS - 10.0).show_percentage());
                 });
                 cell(ui, COL_ACTION, |ui| {
-                    if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                    if ui.small_button("×").on_hover_text("Remove").clicked() {
                         to_remove = Some(idx);
                     }
                 });
@@ -368,7 +370,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                 ui.horizontal(|ui| {
                     ui.add_space(COL_CHECK);
                     ui.label(
-                        egui::RichText::new(format!("⚠ {err}"))
+                        egui::RichText::new(format!("! {err}"))
                             .color(palette::ACCENT_RED).small(),
                     );
                 });
@@ -401,11 +403,25 @@ fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
             )).color(palette::FG_DIM),
         );
 
+        // right_to_left : le 1er pushé est le PLUS À DROITE → on met l'action
+        // primaire (Upload) en premier pour qu'elle soit flush right.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Clear").clicked() {
-                state.items.clear();
+            let busy = state.current_idx.is_some() || state.pending_find_slot;
+            let upload_enabled = checked > 0 && !busy;
+            let label = if busy { "Uploading…".to_string() } else { format!("Upload {} ▶", checked) };
+            // min_size(vec2(0, 32)) → hauteur fixe ; le texte est centré dans
+            // cette hauteur, sans dépendre du galley du glyph ▶ (qui n'a pas
+            // de descendant et fausse la mesure).
+            let upload_btn = egui::Button::new(
+                egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
+            )
+            .fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN })
+            .min_size(egui::vec2(120.0, 32.0));
+            if ui.add_enabled(upload_enabled, upload_btn).clicked() {
+                state.request_upload = true;
             }
-            if ui.button("Reset state").clicked() {
+            ui.add_space(8.0);
+            if ui.add_sized([0.0, 32.0], egui::Button::new("Reset state")).clicked() {
                 for it in &mut state.items {
                     if it.state == UploadItemState::Error || it.state == UploadItemState::Done {
                         it.state = UploadItemState::Pending;
@@ -417,14 +433,8 @@ fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
                     }
                 }
             }
-            let busy = state.current_idx.is_some() || state.pending_find_slot;
-            let upload_enabled = checked > 0 && !busy;
-            let label = if busy { "Uploading…".to_string() } else { format!("Upload {} ▶", checked) };
-            let upload_btn = egui::Button::new(
-                egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
-            ).fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN });
-            if ui.add_enabled(upload_enabled, upload_btn).clicked() {
-                state.request_upload = true;
+            if ui.add_sized([0.0, 32.0], egui::Button::new("Clear")).clicked() {
+                state.items.clear();
             }
         });
     });

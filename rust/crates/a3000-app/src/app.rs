@@ -40,7 +40,8 @@ impl WorkerState {
         match self {
             WorkerState::Idle => "Worker : non démarré".into(),
             WorkerState::Connecting(_) => "Worker : UAC en cours…".into(),
-            WorkerState::Connected(_) => "Worker : connecté ✓".into(),
+            // Pas de glyph Unicode (✓ rend en ☐ avec la font egui par défaut).
+            WorkerState::Connected(_) => "Worker : connecté".into(),
             WorkerState::Error(msg) => format!("Worker : ERREUR — {msg}"),
         }
     }
@@ -195,7 +196,7 @@ impl A3000App {
                 self.try_start_next_upload();
             }
             Event::Error { msg, .. } => {
-                self.status = format!("✗ {msg}");
+                self.status = format!("× {msg}");
                 if let Some(idx) = self.upload.current_idx.take() {
                     if let Some(it) = self.upload.items.get_mut(idx) {
                         it.state = UploadItemState::Error;
@@ -255,7 +256,7 @@ impl A3000App {
             wave_path: item.path.to_string_lossy().to_string(),
         };
         if let Err(e) = sender.send_cmd(&cmd) {
-            self.status = format!("✗ send Transfer: {e}");
+            self.status = format!("× send Transfer: {e}");
             self.upload.current_idx = None;
             if let Some(it) = self.upload.items.get_mut(idx) {
                 it.state = UploadItemState::Error;
@@ -300,7 +301,7 @@ impl A3000App {
             };
             self.upload.pending_find_slot = true;
             if let Err(e) = sender.send_cmd(&cmd) {
-                self.status = format!("✗ send FindFreeSlot: {e}");
+                self.status = format!("× send FindFreeSlot: {e}");
                 self.upload.pending_find_slot = false;
             } else {
                 self.status = "Recherche du 1er slot libre…".into();
@@ -332,7 +333,7 @@ impl A3000App {
                 self.download.samples.clear();
                 self.download.checked.clear();
                 if let Err(e) = handle.sender().send_cmd(&cmd) {
-                    self.status = format!("✗ Scan : {e}");
+                    self.status = format!("× Scan : {e}");
                     self.download.scan_progress = None;
                 } else {
                     self.status = "Scan en cours…".into();
@@ -385,7 +386,7 @@ impl A3000App {
         let out_dir = self.download.output_dir.clone()
             .unwrap_or_else(|| std::env::temp_dir().join("a3000_downloads"));
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
-            self.status = format!("✗ create_dir {}: {e}", out_dir.display());
+            self.status = format!("× create_dir {}: {e}", out_dir.display());
             return;
         }
         let safe_name: String = sample.name.chars()
@@ -407,7 +408,7 @@ impl A3000App {
             output_path: output_path.to_string_lossy().to_string(),
         };
         if let Err(e) = sender.send_cmd(&cmd) {
-            self.status = format!("✗ send Receive: {e}");
+            self.status = format!("× send Receive: {e}");
             self.download.current_idx = None;
         } else {
             self.status = format!("Téléchargement #{next_slot} → {}", output_path.display());
@@ -474,7 +475,7 @@ impl A3000App {
                     if ui.button("Save now").clicked() {
                         match self.config.save() {
                             Ok(()) => self.status = "Config sauvée.".into(),
-                            Err(e) => self.status = format!("✗ Erreur sauvegarde config : {e}"),
+                            Err(e) => self.status = format!("× Erreur sauvegarde config : {e}"),
                         }
                     }
                     ui.label(
@@ -502,8 +503,10 @@ impl eframe::App for A3000App {
         }
 
         // Top bar : tabs + worker status + settings
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_space(4.0);
+        egui::TopBottomPanel::top("tabs")
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 for t in [Tab::Upload, Tab::Download, Tab::Slicer] {
                     let selected = self.active_tab == t;
@@ -538,7 +541,7 @@ impl eframe::App for A3000App {
                     }
                 });
             });
-            ui.add_space(2.0);
+            ui.add_space(6.0);
         });
 
         // Settings modal

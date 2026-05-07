@@ -56,4 +56,14 @@ pub fn apply(ctx: &egui::Context) {
     visuals.error_fg_color = ACCENT_RED;
 
     ctx.set_visuals(visuals);
+
+    // Spacing — défauts egui trop serrés (button_padding=(4,1) par défaut).
+    // On écarte horizontalement + verticalement pour laisser respirer le texte.
+    ctx.style_mut(|style| {
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        // Hauteur minimum d'un widget interactif (incluant boutons / DragValue /
+        // TextEdit / Checkbox) — assure une ligne de base cohérente entre cellules.
+        style.spacing.interact_size = egui::vec2(40.0, 24.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    });
 }
