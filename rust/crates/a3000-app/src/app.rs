@@ -100,10 +100,11 @@ impl A3000App {
         }
         let (tx, rx) = mpsc::channel::<Result<WorkerHandle, WorkerError>>();
         let ctx_clone = ctx.clone();
+        let ctx_for_reader = ctx.clone();
         std::thread::Builder::new()
             .name("worker-start".into())
             .spawn(move || {
-                let result = WorkerHandle::start(Duration::from_secs(60));
+                let result = WorkerHandle::start(Duration::from_secs(60), ctx_for_reader);
                 let _ = tx.send(result);
                 ctx_clone.request_repaint();
             })

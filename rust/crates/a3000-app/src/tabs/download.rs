@@ -68,6 +68,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
 
     ui.separator();
 
+    // Footer ancré en bas (cf. upload.rs : sinon la ScrollArea avale tout).
+    let footer_id = ui.id().with("download_footer");
+    egui::TopBottomPanel::bottom(footer_id)
+        .resizable(false)
+        .show_inside(ui, |ui| {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let n_checked = state.checked.len();
+                ui.label(
+                    egui::RichText::new(format!("Sélectionnés : {n_checked}/{}", state.samples.len()))
+                        .color(palette::FG_DIM),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = state.current_idx.is_some();
+                    let dl_enabled = !busy && n_checked > 0;
+                    let label = if busy { "Downloading…".to_string() }
+                                else { format!("Download {} ▶", n_checked) };
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
+                    ).fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN });
+                    if ui.add_enabled(dl_enabled, btn).clicked() {
+                        state.request_download = true;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+
     if state.samples.is_empty() {
         ui.add_space(60.0);
         ui.vertical_centered(|ui| {
@@ -75,31 +104,9 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
                 egui::RichText::new("Aucun scan effectué").color(palette::FG_DIM).size(18.0),
             );
         });
-        ui.add_space(60.0);
     } else {
         show_table(ui, state);
     }
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        let n_checked = state.checked.len();
-        ui.label(
-            egui::RichText::new(format!("Sélectionnés : {n_checked}/{}", state.samples.len()))
-                .color(palette::FG_DIM),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let busy = state.current_idx.is_some();
-            let dl_enabled = !busy && n_checked > 0;
-            let label = if busy { "Downloading…".to_string() }
-                        else { format!("Download {} ▶", n_checked) };
-            let btn = egui::Button::new(
-                egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
-            ).fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN });
-            if ui.add_enabled(dl_enabled, btn).clicked() {
-                state.request_download = true;
-            }
-        });
-    });
 }
 
 const ROW_H: f32 = 22.0;

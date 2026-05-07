@@ -206,14 +206,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut UploadState, config: &Config) {
     );
     ui.separator();
 
+    // Footer ancré en bas via TopBottomPanel — sinon la ScrollArea du table
+    // mange toute la hauteur disponible et le bouton Upload sort de l'écran.
+    let footer_id = ui.id().with("upload_footer");
+    egui::TopBottomPanel::bottom(footer_id)
+        .resizable(false)
+        .show_inside(ui, |ui| {
+            ui.add_space(4.0);
+            ui.separator();
+            show_footer(ui, state);
+            ui.add_space(4.0);
+        });
+
+    // Reste de l'espace : table ou drop zone.
     if state.items.is_empty() {
         empty_drop_zone(ui);
     } else {
         show_table(ui, state);
     }
-
-    ui.separator();
-    show_footer(ui, state);
 }
 
 fn empty_drop_zone(ui: &mut egui::Ui) {

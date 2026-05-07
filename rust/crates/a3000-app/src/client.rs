@@ -82,8 +82,10 @@ unsafe impl Send for WorkerHandle {}
 
 impl WorkerHandle {
     /// Lance le worker élevé et attend le ready handshake. Démarre aussi
-    /// le thread reader qui pousse les Events suivants dans le channel.
-    pub fn start(connect_timeout: Duration) -> Result<Self> {
+    /// le thread reader qui pousse les Events suivants dans le channel,
+    /// ET appelle `ctx.request_repaint()` à chaque event arrivé pour réveiller
+    /// la GUI (sinon les events s'accumulent jusqu'à la prochaine frame).
+    pub fn start(connect_timeout: Duration, ctx: eframe::egui::Context) -> Result<Self> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         let port = listener.local_addr()?.port();
 
@@ -149,6 +151,10 @@ impl WorkerHandle {
                             if event_tx.send(e).is_err() {
                                 break;
                             }
+                            // Réveille la GUI : sans ça la barre de progression
+                            // ne se redessine que quand egui a déjà décidé de
+                            // refaire un frame, ce qui rend l'animation saccadée.
+                            ctx.request_repaint();
                         }
                         Err(_) => continue,
                     }

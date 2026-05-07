@@ -166,16 +166,18 @@ fn dispatch(
         Cmd::Receive { bus, target, lun, sample_number, output_path, .. } => {
             let target = ScsiTarget { path_id: *bus, target_id: *target, lun: *lun };
             let writer_progress = w.try_clone()?;
-            let mut last_pct: i32 = -1;
+            let mut last_send = std::time::Instant::now() - std::time::Duration::from_millis(100);
+            let throttle = std::time::Duration::from_millis(33); // ~30 events/s
             let mut on_progress = move |_pkt: usize, sent: usize, total: usize| {
-                let pct = (sent as i64 * 100 / total.max(1) as i64) as i32;
-                if pct != last_pct {
+                let now = std::time::Instant::now();
+                let is_final = sent == total;
+                if is_final || now.duration_since(last_send) >= throttle {
                     if let Ok(mut wp) = writer_progress.try_clone() {
                         let _ = send_event(&mut wp, &Event::Progress {
                             sent: sent as u64, total: total as u64,
                         });
                     }
-                    last_pct = pct;
+                    last_send = now;
                 }
             };
 
@@ -210,16 +212,18 @@ fn dispatch(
             };
             let opts = TransferOptions::default();
             let writer_progress = w.try_clone()?;
-            let mut last_pct: i32 = -1;
+            let mut last_send = std::time::Instant::now() - std::time::Duration::from_millis(100);
+            let throttle = std::time::Duration::from_millis(33); // ~30 events/s
             let mut on_progress = move |_pkt: usize, sent: usize, total: usize| {
-                let pct = (sent as i64 * 100 / total.max(1) as i64) as i32;
-                if pct != last_pct {
+                let now = std::time::Instant::now();
+                let is_final = sent == total;
+                if is_final || now.duration_since(last_send) >= throttle {
                     if let Ok(mut wp) = writer_progress.try_clone() {
                         let _ = send_event(&mut wp, &Event::Progress {
                             sent: sent as u64, total: total as u64,
                         });
                     }
-                    last_pct = pct;
+                    last_send = now;
                 }
             };
             let stats = transfer_sample(
