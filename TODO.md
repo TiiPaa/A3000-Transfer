@@ -15,10 +15,10 @@
 - [x] Rust Phase 3d.2 — Settings dialog modal HA/Bus/Target/LUN + auto/manual start slot
 - [x] Rust Phase 3d.3 — Upload tab : table colonnes + drag-IN WAV + batch via WorkerSender (FindFreeSlot → Transfer séquentiel + progress live)
 - [x] Rust Phase 3d.4 — Download tab : Scan → ListSamples → table samples + Download batch séquentiel
-- [ ] **REPRENDRE ICI** Bug UI : colonnes des tables Upload/Download décalées quand plusieurs items (set_min_size + allocate_ui_with_layout pas suffisants — investiguer egui_extras::TableBuilder ou allocate_exact_size + child_ui)
+- [x] Fix alignement colonnes tables Upload/Download : `allocate_exact_size` + `child_ui` + `TextWrapMode::Truncate` (les labels longs ne poussent plus le layout)
+- [ ] **REPRENDRE ICI** Rust Phase 4 — Slicer egui + custom waveform widget + drag-out OLE MIDI
 
 ## Moyen terme (Sprint)
-- [ ] Rust Phase 4 — Slicer egui + custom waveform widget + drag-out OLE MIDI
 - [ ] Rust Phase 5 — Polish + design dark theme + packaging release
 
 ## Long terme (Backlog)

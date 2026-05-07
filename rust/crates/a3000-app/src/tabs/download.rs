@@ -112,15 +112,15 @@ const COL_DUR: f32 = 70.0;
 const COL_PROGRESS: f32 = 140.0;
 
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.allocate_ui_with_layout(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(w, ROW_H),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_min_size(egui::vec2(w, ROW_H));
-            ui.set_clip_rect(ui.max_rect());
-            add(ui)
-        },
-    ).inner
+        egui::Sense::hover(),
+    );
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    let mut child = ui.child_ui(rect, layout, None);
+    child.set_clip_rect(rect);
+    child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    add(&mut child)
 }
 
 fn show_table(ui: &mut egui::Ui, state: &mut DownloadState) {

@@ -244,18 +244,20 @@ const COL_STATE: f32 = 80.0;
 const COL_PROGRESS: f32 = 140.0;
 const COL_ACTION: f32 = 28.0;
 
-/// Cellule de largeur **strictement fixe** (W × ROW_H), contenu aligné gauche
-/// + centré vertical. set_min_size force la taille même si le contenu est court.
+/// Cellule de largeur **strictement fixe** (W × ROW_H) : `allocate_exact_size`
+/// réserve un rect immuable au parent, on construit un child_ui bordé par ce
+/// rect avec clipping + wrap=Truncate. Les labels trop longs sont tronqués
+/// au lieu de pousser le layout.
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.allocate_ui_with_layout(
+    let (rect, _) = ui.allocate_exact_size(
         egui::vec2(w, ROW_H),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_min_size(egui::vec2(w, ROW_H));
-            ui.set_clip_rect(ui.max_rect());
-            add(ui)
-        },
-    ).inner
+        egui::Sense::hover(),
+    );
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    let mut child = ui.child_ui(rect, layout, None);
+    child.set_clip_rect(rect);
+    child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    add(&mut child)
 }
 
 fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
