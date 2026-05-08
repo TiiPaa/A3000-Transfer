@@ -29,6 +29,7 @@ use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 
+use a3000_core::midi::generate_midi;
 use a3000_core::wav::{load_wave, WaveError, WavePayload};
 use a3000_onset::{detect_transients, DetectOptions};
 
@@ -51,6 +52,8 @@ pub struct SlicerState {
     dragging_pan: Option<(f32, usize)>,
     /// Onset focalisé pour la navigation Space / Shift+Space.
     current_onset: Option<usize>,
+    /// Dernier path MIDI généré (pour afficher / drag-out futur).
+    pub last_midi_path: Option<PathBuf>,
     /// Drag-select : slice idx où le drag a commencé + valeur cible.
     drag_select_start: Option<usize>,
     drag_select_target: bool,
@@ -342,6 +345,40 @@ impl SlicerState {
         self.peaks_cache = None;
     }
 
+    /// Génère un fichier MIDI dans `%TEMP%/a3000_slicer_midi/<stem>.mid` à
+    /// partir des onsets courants. Retourne le path écrit, ou une erreur
+    /// stringifiée à afficher dans le status.
+    pub fn generate_midi_file(&mut self) -> Result<PathBuf, String> {
+        let audio = self.audio.as_ref().ok_or("Aucun fichier audio chargé")?;
+        if self.onsets.is_empty() {
+            return Err("Aucun onset à exporter".into());
+        }
+        let stem = self.source_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("slicer")
+            .to_string();
+        let track_name: String = stem.chars().take(32).collect();
+        let onsets_i64: Vec<i64> = self.onsets.iter().map(|&o| o as i64).collect();
+        let bytes = generate_midi(
+            &onsets_i64,
+            audio.mono.len() as u64,
+            audio.sample_rate,
+            self.n_beats.max(1),
+            &track_name,
+        ).map_err(|e| format!("MIDI : {e}"))?;
+
+        let dir = std::env::temp_dir().join("a3000_slicer_midi");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
+        let safe_stem: String = stem.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{safe_stem}.mid"));
+        std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
+        self.last_midi_path = Some(path.clone());
+        Ok(path)
+    }
+
     pub fn reset_view(&mut self) {
         if let Some(audio) = &self.audio {
             self.view = ViewWindow { start: 0, end: audio.mono.len() };
@@ -409,7 +446,7 @@ impl SlicerState {
     }
 }
 
-fn format_wav_err(e: &WaveError) -> String { format!("{e}") }
+fn format_wav_err(e: &WaveError) -> String { format!("× WAV : {e}") }
 
 fn pcm16_le_to_mono_f32(payload: &WavePayload) -> AudioData {
     let channels = payload.channels.max(1);
@@ -482,12 +519,23 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
 
     show_top_bar(ui, state);
 
-    if let Some(err) = &state.error {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(format!("! Erreur : {err}"))
-                .color(palette::ACCENT_RED),
+    // Ligne de message à hauteur **strictement fixe** (allocate_exact_size,
+    // pas allocate_ui_with_layout qui rétrécit à la taille du contenu) :
+    // la waveform ne bouge plus à l'apparition / disparition du message.
+    let (msg_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 22.0),
+        egui::Sense::hover(),
+    );
+    if let Some(msg) = &state.error {
+        let mut child = ui.child_ui(
+            msg_rect,
+            egui::Layout::left_to_right(egui::Align::Center),
+            None,
         );
+        child.set_clip_rect(msg_rect);
+        let is_error = msg.starts_with('×') || msg.starts_with('!');
+        let color = if is_error { palette::ACCENT_RED } else { palette::ACCENT_GREEN };
+        child.label(egui::RichText::new(msg).color(color).strong());
     }
 
     // Footer ancré en bas (cf. upload/download).
@@ -921,8 +969,10 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
     ui.horizontal(|ui| {
         if total > 0 {
             ui.label(
-                egui::RichText::new(format!("Marqués : {marked}/{total}"))
-                    .color(palette::FG_DIM),
+                egui::RichText::new(format!(
+                    "Marqués : {marked}/{total} — {} onsets",
+                    state.onsets.len(),
+                )).color(palette::FG_DIM),
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -956,8 +1006,95 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
             }).inner.clicked() {
                 for m in &mut state.marked { *m = true; }
             }
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Génération MIDI : bouton + spinbox N beats juste à gauche.
+            let midi_btn = egui::Button::new(
+                egui::RichText::new("Save MIDI").color(egui::Color32::WHITE),
+            ).fill(palette::ACCENT_YELLOW);
+            let midi_enabled = has_audio && !state.onsets.is_empty();
+            if ui.add_enabled_ui(midi_enabled, |ui| {
+                ui.add_sized([110.0, BTN_H], midi_btn)
+            }).inner.clicked() {
+                match state.generate_midi_file() {
+                    Ok(p) => state.error = Some(format!("MIDI sauvé : {}", p.display())),
+                    Err(e) => state.error = Some(format!("× {e}")),
+                }
+            }
+            ui.add_space(4.0);
+
+            // Bouton Drag MIDI : press+drag déclenche un OLE drag-drop vers
+            // l'app sous le curseur (typiquement un DAW). Régénère le fichier
+            // si besoin pour qu'il soit toujours à jour.
+            #[cfg(windows)]
+            {
+                let drag_resp = drag_midi_button(ui, midi_enabled, BTN_H);
+                if drag_resp.drag_started() {
+                    let path_res = match &state.last_midi_path {
+                        Some(p) if p.exists() => Ok(p.clone()),
+                        _ => state.generate_midi_file(),
+                    };
+                    match path_res {
+                        Ok(p) => {
+                            match crate::ole_drag::drag_file(&p) {
+                                Ok(eff) if eff.0 != 0 => {
+                                    state.error = Some(format!(
+                                        "MIDI déposé dans le DAW ({})", p.display(),
+                                    ));
+                                }
+                                Ok(_) => state.error = Some("Drag annulé".into()),
+                                Err(e) => state.error = Some(format!("× drag : {e}")),
+                            }
+                        }
+                        Err(e) => state.error = Some(format!("× {e}")),
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.add_enabled_ui(has_audio, |ui| {
+                ui.add(egui::DragValue::new(&mut state.n_beats).range(1..=64));
+            });
+            ui.label(egui::RichText::new("Beats :").color(palette::FG_DIM));
         });
     });
+}
+
+/// Bouton custom "Drag MIDI" peint à la main pour pouvoir capter `Sense::drag()`
+/// (le widget `Button` standard d'egui n'expose qu'un click sense).
+#[cfg(windows)]
+fn drag_midi_button(ui: &mut egui::Ui, enabled: bool, h: f32) -> egui::Response {
+    let size = egui::vec2(110.0, h);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if !enabled {
+        resp = resp.on_disabled_hover_text("Charger un WAV avant");
+    }
+    let visuals = ui.style().interact(&resp);
+    let fill = if !enabled {
+        palette::BG_PANEL_LIGHT
+    } else if resp.is_pointer_button_down_on() {
+        palette::ACCENT_ORANGE
+    } else if resp.hovered() {
+        palette::BG_HOVER
+    } else {
+        palette::ACCENT_YELLOW
+    };
+    ui.painter().rect(rect, 4.0, fill, visuals.bg_stroke);
+    let text_color = if enabled { egui::Color32::WHITE } else { palette::FG_DIM };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Drag MIDI",
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+    if resp.hovered() && enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    resp
 }
 
 /// Compute peaks (min, max amplitude) par pixel-bin sur la fenêtre

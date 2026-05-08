@@ -22,10 +22,11 @@
 - [x] Rust Phase 4a — Slicer : drop WAV → waveform peaks + onsets auto-détectés via a3000-onset
 - [x] Rust Phase 4b — Slicer : selection cells (click + drag-select range) + drag onsets (capture onset au press, pas au drag_started)
 - [x] Rust Phase 4c — Slicer : Delete marked (rebuild audio + onsets) + audio playback cpal (resampling fixed-point 32.32 préserve la hauteur) + playhead animée + zoom (molette anchor curseur, factor 1.1×) + pan (drag souris OU Shift+molette) + navigation Space / Ctrl+Space par onset
-- [ ] **REPRENDRE ICI** Rust Phase 4d — Slicer : Beats spinbox + génération MIDI via a3000_core::midi::generate_midi (Save MIDI to…)
+- [x] Rust Phase 4d — Slicer : Beats spinbox + Save MIDI button (a3000_core::midi::generate_midi → %TEMP%/a3000_slicer_midi/<stem>.mid) + ligne de message à hauteur fixe (allocate_exact_size, ne pousse pas la waveform)
+- [x] Rust Phase 4e — Slicer : drag-OUT MIDI vers DAW via OLE (#[implement] IDataObject + IDropSource + IEnumFORMATETC fournissant CF_HDROP, DoDragDrop synchrone)
+- [ ] **REPRENDRE ICI** Rust Phase 5 — Polish + design dark theme + packaging release
 
 ## Moyen terme (Sprint)
-- [ ] Rust Phase 5 — Polish + design dark theme + packaging release
 
 ## Long terme (Backlog)
 - [ ] Distribuer le .exe (Python) avec un installeur signé (élimine l'avertissement Defender)

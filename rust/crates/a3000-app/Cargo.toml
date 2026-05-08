@@ -40,6 +40,7 @@ tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+windows-core.workspace = true
 
 [build-dependencies]
 # Embed icon ressource Windows

@@ -20,6 +20,8 @@ mod theme;
 #[cfg(windows)]
 mod client;
 #[cfg(windows)]
+mod ole_drag;
+#[cfg(windows)]
 mod worker;
 
 use std::process::ExitCode;
@@ -39,6 +41,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    }
+
+    // OLE init pour le thread principal (drag-out MIDI vers DAW).
+    #[cfg(windows)]
+    if let Err(e) = ole_drag::init_ole_thread() {
+        eprintln!("OleInitialize warning: {e}");
     }
 
     // Mode GUI (defaut).
