@@ -185,6 +185,9 @@ fn drain_dropped_wavs(ctx: &egui::Context) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Réservation pour le footer (séparateur + ligne boutons + spacing).
+const FOOTER_RESERVED_H: f32 = 70.0;
+
 pub fn show(ui: &mut egui::Ui, state: &mut UploadState, config: &Config) {
     // Drop : on ajoute les fichiers WAV droppés.
     let dropped = drain_dropped_wavs(ui.ctx());
@@ -207,24 +210,31 @@ pub fn show(ui: &mut egui::Ui, state: &mut UploadState, config: &Config) {
     );
     ui.separator();
 
-    // Footer ancré en bas via TopBottomPanel — sinon la ScrollArea du table
-    // mange toute la hauteur disponible et le bouton Upload sort de l'écran.
-    let footer_id = ui.id().with("upload_footer");
-    egui::TopBottomPanel::bottom(footer_id)
-        .resizable(false)
-        .show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.separator();
-            show_footer(ui, state);
-            ui.add_space(4.0);
-        });
-
-    // Reste de l'espace : table ou drop zone.
-    if state.items.is_empty() {
-        empty_drop_zone(ui);
-    } else {
-        show_table(ui, state);
+    // Bloc table cadré strictement via allocate_exact_size + child_ui +
+    // set_clip_rect : pareil que pour les cells de table, c'est la SEULE
+    // façon en egui d'obtenir un clipping VISUEL qui empêche les rows de
+    // déborder par-dessus le header/footer (ui.allocate_ui borne le layout
+    // cursor mais pas le painter).
+    let block_h = (ui.available_height() - FOOTER_RESERVED_H).max(100.0);
+    let block_size = egui::vec2(ui.available_width(), block_h);
+    let (block_rect, _) = ui.allocate_exact_size(block_size, egui::Sense::hover());
+    {
+        let mut block_ui = ui.child_ui(
+            block_rect,
+            egui::Layout::top_down(egui::Align::Min),
+            None,
+        );
+        block_ui.set_clip_rect(block_rect);
+        if state.items.is_empty() {
+            empty_drop_zone(&mut block_ui);
+        } else {
+            show_table(&mut block_ui, state);
+        }
     }
+
+    // Footer en bas, dans l'espace réservé.
+    ui.separator();
+    show_footer(ui, state);
 }
 
 fn empty_drop_zone(ui: &mut egui::Ui) {
@@ -273,7 +283,13 @@ fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R
 }
 
 fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+    // max_height explicite : sans ça la ScrollArea déborde sous le footer
+    // quand le nombre d'items dépasse la hauteur disponible.
+    let max_h = ui.available_height();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .max_height(max_h)
+        .show(ui, |ui| {
         // Header row — mêmes largeurs que les rows pour alignement strict.
         ui.horizontal(|ui| {
             // Check-all

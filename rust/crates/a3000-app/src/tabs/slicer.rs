@@ -54,6 +54,9 @@ pub struct SlicerState {
     current_onset: Option<usize>,
     /// Dernier path MIDI généré (pour afficher / drag-out futur).
     pub last_midi_path: Option<PathBuf>,
+    /// Flag : l'utilisateur a cliqué Send to Upload — l'app fait l'export
+    /// (découpe + WAV) et bascule sur le tab Upload.
+    pub request_send_to_upload: bool,
     /// Drag-select : slice idx où le drag a commencé + valeur cible.
     drag_select_start: Option<usize>,
     drag_select_target: bool,
@@ -345,6 +348,59 @@ impl SlicerState {
         self.peaks_cache = None;
     }
 
+    /// Découpe le buffer audio aux onsets et écrit chaque slice (non marquée)
+    /// comme un fichier WAV mono 16-bit dans
+    /// `%TEMP%/a3000_slicer_slices/<stem>_slice_NNN.wav`. Retourne la liste
+    /// des paths générés (ou une erreur stringifiée).
+    pub fn export_slices_to_wavs(&self) -> Result<Vec<PathBuf>, String> {
+        let audio = self.audio.as_ref().ok_or("Aucun fichier audio chargé")?;
+        if self.onsets.is_empty() {
+            return Err("Aucun onset à exporter".into());
+        }
+        let stem = self.source_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("slicer")
+            .to_string();
+        let safe_stem: String = stem.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let dir = std::env::temp_dir().join("a3000_slicer_slices");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
+
+        let total = audio.mono.len();
+        let n = self.onsets.len();
+        let n_digits = (n.to_string().len()).max(3);
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: audio.sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for (i, &start) in self.onsets.iter().enumerate() {
+            let end = self.onsets.get(i + 1).copied().unwrap_or(total).min(total);
+            if start >= end || self.marked.get(i).copied().unwrap_or(false) {
+                continue; // slice marquée pour suppression : ignorée
+            }
+            let path = dir.join(format!(
+                "{safe_stem}_slice_{:0width$}.wav", i + 1, width = n_digits,
+            ));
+            let mut writer = hound::WavWriter::create(&path, spec)
+                .map_err(|e| format!("WAV {}: {e}", path.display()))?;
+            for &s in &audio.mono[start..end] {
+                let s16 = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                writer.write_sample(s16)
+                    .map_err(|e| format!("write_sample: {e}"))?;
+            }
+            writer.finalize()
+                .map_err(|e| format!("finalize: {e}"))?;
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
     /// Génère un fichier MIDI dans `%TEMP%/a3000_slicer_midi/<stem>.mid` à
     /// partir des onsets courants. Retourne le path écrit, ou une erreur
     /// stringifiée à afficher dans le status.
@@ -538,28 +594,35 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
         child.label(egui::RichText::new(msg).color(color).strong());
     }
 
-    // Footer ancré en bas (cf. upload/download).
-    let footer_id = ui.id().with("slicer_footer");
-    egui::TopBottomPanel::bottom(footer_id)
-        .resizable(false)
-        .show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.separator();
-            show_footer(ui, state);
-            ui.add_space(4.0);
-        });
-
-    if state.audio.is_some() {
-        ui.add_space(8.0);
-        show_canvas(ui, state);
-    } else if state.error.is_none() {
-        ui.add_space(60.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new("Drop un WAV ici").color(palette::FG_DIM).size(20.0),
-            );
-        });
+    // Bloc canvas cadré strictement (allocate_exact_size + child_ui +
+    // set_clip_rect) — cohérent avec upload/download.
+    const FOOTER_RESERVED_H: f32 = 70.0;
+    let block_h = (ui.available_height() - FOOTER_RESERVED_H).max(100.0);
+    let block_size = egui::vec2(ui.available_width(), block_h);
+    let (block_rect, _) = ui.allocate_exact_size(block_size, egui::Sense::hover());
+    {
+        let mut block_ui = ui.child_ui(
+            block_rect,
+            egui::Layout::top_down(egui::Align::Min),
+            None,
+        );
+        block_ui.set_clip_rect(block_rect);
+        if state.audio.is_some() {
+            block_ui.add_space(8.0);
+            show_canvas(&mut block_ui, state);
+        } else if state.error.is_none() {
+            block_ui.add_space(60.0);
+            block_ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Drop un WAV ici").color(palette::FG_DIM).size(20.0),
+                );
+            });
+        }
     }
+
+    // Footer en bas, dans l'espace réservé.
+    ui.separator();
+    show_footer(ui, state);
 }
 
 fn show_top_bar(ui: &mut egui::Ui, state: &mut SlicerState) {
@@ -977,7 +1040,25 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let has_audio = state.audio.is_some();
-            // Reset (recharge fichier source) — secondary, à droite
+            let has_slices = !state.onsets.is_empty();
+            let unmarked = state.slice_count().saturating_sub(state.marked_count());
+
+            // Send to Upload — action primaire (verte) flush right. Pas de
+            // glyph Unicode (→ U+2192 n'est pas dans la font egui par défaut).
+            let send_btn = egui::Button::new(
+                egui::RichText::new(format!("Send to Upload ({unmarked})"))
+                    .color(egui::Color32::WHITE),
+            ).fill(palette::ACCENT_GREEN);
+            if ui.add_enabled_ui(has_audio && has_slices && unmarked > 0, |ui| {
+                ui.add_sized([170.0, BTN_H], send_btn)
+            }).inner.clicked() {
+                state.request_send_to_upload = true;
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // Reset (recharge fichier source) — secondary
             if ui.add_enabled_ui(has_audio, |ui| {
                 ui.add_sized([100.0, BTN_H], egui::Button::new("Reset"))
             }).inner.clicked() {

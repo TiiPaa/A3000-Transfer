@@ -418,6 +418,32 @@ impl A3000App {
     #[cfg(not(windows))]
     fn try_start_next_download(&mut self) {}
 
+    /// Slicer → Upload : exporte les slices non marquées en WAV et les ajoute
+    /// à la queue Upload, puis bascule sur le tab Upload.
+    fn poll_slicer_send_to_upload(&mut self) {
+        if !self.slicer.request_send_to_upload {
+            return;
+        }
+        self.slicer.request_send_to_upload = false;
+        match self.slicer.export_slices_to_wavs() {
+            Ok(paths) => {
+                let n = paths.len();
+                for p in paths {
+                    self.upload.add_path(p);
+                }
+                self.active_tab = Tab::Upload;
+                self.status = format!(
+                    "{n} slice{} envoyée{} dans le tab Upload",
+                    if n > 1 { "s" } else { "" },
+                    if n > 1 { "s" } else { "" },
+                );
+            }
+            Err(e) => {
+                self.slicer.error = Some(format!("× Send to Upload : {e}"));
+            }
+        }
+    }
+
     /// Modal Settings : édite HA/BUS/TARGET/LUN + auto/manual start slot.
     /// Pas de Save/Cancel ; les changements sont live et persistés au save()
     /// d'eframe. Bouton Close ferme la fenêtre.
@@ -494,6 +520,7 @@ impl eframe::App for A3000App {
         self.poll_worker(ctx);
         self.poll_upload_request();
         self.poll_download_request();
+        self.poll_slicer_send_to_upload();
 
         // Si on est en train de se connecter, on repaint régulièrement pour
         // récupérer la transition.

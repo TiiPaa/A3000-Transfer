@@ -35,6 +35,9 @@ pub struct DownloadState {
     pub download_progress: f32,
 }
 
+/// Réservation pour le footer (cf. upload.rs).
+const FOOTER_RESERVED_H: f32 = 70.0;
+
 pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
     ui.add_space(6.0);
     ui.heading("Download");
@@ -72,49 +75,56 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
 
     ui.separator();
 
-    // Footer ancré en bas (cf. upload.rs : sinon la ScrollArea avale tout).
-    let footer_id = ui.id().with("download_footer");
-    egui::TopBottomPanel::bottom(footer_id)
-        .resizable(false)
-        .show_inside(ui, |ui| {
-            ui.add_space(4.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                let n_checked = state.checked.len();
+    // Bloc table cadré strictement (allocate_exact_size + child_ui +
+    // set_clip_rect) — clip VISUEL pour empêcher les rows de déborder
+    // par-dessus header/footer.
+    let block_h = (ui.available_height() - FOOTER_RESERVED_H).max(100.0);
+    let block_size = egui::vec2(ui.available_width(), block_h);
+    let (block_rect, _) = ui.allocate_exact_size(block_size, egui::Sense::hover());
+    {
+        let mut block_ui = ui.child_ui(
+            block_rect,
+            egui::Layout::top_down(egui::Align::Min),
+            None,
+        );
+        block_ui.set_clip_rect(block_rect);
+        if state.samples.is_empty() {
+            block_ui.add_space(60.0);
+            block_ui.vertical_centered(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("Sélectionnés : {n_checked}/{}", state.samples.len()))
-                        .color(palette::FG_DIM),
+                    egui::RichText::new("Aucun scan effectué").color(palette::FG_DIM).size(18.0),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let busy = state.current_idx.is_some();
-                    let dl_enabled = !busy && n_checked > 0;
-                    let label = if busy { "Downloading…".to_string() }
-                                else { format!("Download {}", n_checked) };
-                    let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
-                    let btn = egui::Button::new(
-                        egui::RichText::new(label).color(egui::Color32::WHITE),
-                    ).fill(fill);
-                    let resp = ui.add_enabled_ui(dl_enabled, |ui| {
-                        ui.add_sized([140.0, 32.0], btn)
-                    }).inner;
-                    if resp.clicked() {
-                        state.request_download = true;
-                    }
-                });
             });
-            ui.add_space(4.0);
-        });
-
-    if state.samples.is_empty() {
-        ui.add_space(60.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new("Aucun scan effectué").color(palette::FG_DIM).size(18.0),
-            );
-        });
-    } else {
-        show_table(ui, state);
+        } else {
+            show_table(&mut block_ui, state);
+        }
     }
+
+    // Footer en bas, dans l'espace réservé.
+    ui.separator();
+    ui.horizontal(|ui| {
+        let n_checked = state.checked.len();
+        ui.label(
+            egui::RichText::new(format!("Sélectionnés : {n_checked}/{}", state.samples.len()))
+                .color(palette::FG_DIM),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let busy = state.current_idx.is_some();
+            let dl_enabled = !busy && n_checked > 0;
+            let label = if busy { "Downloading…".to_string() }
+                        else { format!("Download {}", n_checked) };
+            let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
+            let btn = egui::Button::new(
+                egui::RichText::new(label).color(egui::Color32::WHITE),
+            ).fill(fill);
+            let resp = ui.add_enabled_ui(dl_enabled, |ui| {
+                ui.add_sized([140.0, 32.0], btn)
+            }).inner;
+            if resp.clicked() {
+                state.request_download = true;
+            }
+        });
+    });
 }
 
 const ROW_H: f32 = 28.0;
@@ -139,7 +149,11 @@ fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R
 }
 
 fn show_table(ui: &mut egui::Ui, state: &mut DownloadState) {
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+    let max_h = ui.available_height();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false; 2])
+        .max_height(max_h)
+        .show(ui, |ui| {
         // Header row
         ui.horizontal(|ui| {
             cell(ui, COL_CHECK, |ui| {
