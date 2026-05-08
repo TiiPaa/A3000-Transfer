@@ -405,23 +405,28 @@ fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
 
         // right_to_left : le 1er pushé est le PLUS À DROITE → on met l'action
         // primaire (Upload) en premier pour qu'elle soit flush right.
+        // Tous les boutons utilisent `add_sized([_, BTN_H])` pour passer par
+        // le même chemin layout (`centered_and_justified`) et garantir un Y
+        // cohérent. Pas de `RichText::strong()` ni de glyph ▶ (galley
+        // asymétrique) sur Upload : la couleur verte suffit à marquer
+        // l'action primaire.
+        const BTN_H: f32 = 32.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = state.current_idx.is_some() || state.pending_find_slot;
             let upload_enabled = checked > 0 && !busy;
-            let label = if busy { "Uploading…".to_string() } else { format!("Upload {} ▶", checked) };
-            // min_size(vec2(0, 32)) → hauteur fixe ; le texte est centré dans
-            // cette hauteur, sans dépendre du galley du glyph ▶ (qui n'a pas
-            // de descendant et fausse la mesure).
+            let label = if busy { "Uploading…".to_string() } else { format!("Upload {}", checked) };
+            let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
             let upload_btn = egui::Button::new(
-                egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
-            )
-            .fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN })
-            .min_size(egui::vec2(120.0, 32.0));
-            if ui.add_enabled(upload_enabled, upload_btn).clicked() {
+                egui::RichText::new(label).color(egui::Color32::WHITE),
+            ).fill(fill);
+            let resp = ui.add_enabled_ui(upload_enabled, |ui| {
+                ui.add_sized([120.0, BTN_H], upload_btn)
+            }).inner;
+            if resp.clicked() {
                 state.request_upload = true;
             }
             ui.add_space(8.0);
-            if ui.add_sized([0.0, 32.0], egui::Button::new("Reset state")).clicked() {
+            if ui.add_sized([0.0, BTN_H], egui::Button::new("Reset state")).clicked() {
                 for it in &mut state.items {
                     if it.state == UploadItemState::Error || it.state == UploadItemState::Done {
                         it.state = UploadItemState::Pending;
@@ -433,7 +438,7 @@ fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
                     }
                 }
             }
-            if ui.add_sized([0.0, 32.0], egui::Button::new("Clear")).clicked() {
+            if ui.add_sized([0.0, BTN_H], egui::Button::new("Clear")).clicked() {
                 state.items.clear();
             }
         });

@@ -49,10 +49,11 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
     // Header : bouton Scan + progress + output dir
     ui.horizontal(|ui| {
         let busy = state.current_idx.is_some();
-        let scan_btn = egui::Button::new("Scan")
-            .fill(palette::BG_PANEL_LIGHT)
-            .min_size(egui::vec2(80.0, 32.0));
-        if ui.add_enabled(!busy, scan_btn).clicked() {
+        let scan_btn = egui::Button::new("Scan").fill(palette::BG_PANEL_LIGHT);
+        let resp = ui.add_enabled_ui(!busy, |ui| {
+            ui.add_sized([80.0, 32.0], scan_btn)
+        }).inner;
+        if resp.clicked() {
             state.request_scan = true;
         }
         if let Some((scanned, found)) = state.scan_progress {
@@ -88,13 +89,15 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
                     let busy = state.current_idx.is_some();
                     let dl_enabled = !busy && n_checked > 0;
                     let label = if busy { "Downloading…".to_string() }
-                                else { format!("Download {} ▶", n_checked) };
+                                else { format!("Download {}", n_checked) };
+                    let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
                     let btn = egui::Button::new(
-                        egui::RichText::new(label).color(egui::Color32::WHITE).strong(),
-                    )
-                    .fill(if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN })
-                    .min_size(egui::vec2(140.0, 32.0));
-                    if ui.add_enabled(dl_enabled, btn).clicked() {
+                        egui::RichText::new(label).color(egui::Color32::WHITE),
+                    ).fill(fill);
+                    let resp = ui.add_enabled_ui(dl_enabled, |ui| {
+                        ui.add_sized([140.0, 32.0], btn)
+                    }).inner;
+                    if resp.clicked() {
                         state.request_download = true;
                     }
                 });
