@@ -21,7 +21,8 @@
 - [x] Fix UI : alignement vertical boutons footer Upload/Download — tous les boutons passent par `add_sized([_, 32], …)` (chemin layout `centered_and_justified` uniforme) au lieu de mélanger `min_size` et `add_sized` ; retrait de `RichText::strong()` et du glyph `▶` (galley asymétrique) sur Upload/Download
 - [x] Rust Phase 4a — Slicer : drop WAV → waveform peaks + onsets auto-détectés via a3000-onset
 - [x] Rust Phase 4b — Slicer : selection cells (click + drag-select range) + drag onsets (capture onset au press, pas au drag_started)
-- [ ] **REPRENDRE ICI** Rust Phase 4c — Slicer : audio playback cpal + playhead animée + bouton Delete marked (rebuild audio + onsets)
+- [x] Rust Phase 4c — Slicer : Delete marked (rebuild audio + onsets) + audio playback cpal (resampling fixed-point 32.32 préserve la hauteur) + playhead animée + zoom (molette anchor curseur, factor 1.1×) + pan (drag souris OU Shift+molette) + navigation Space / Ctrl+Space par onset
+- [ ] **REPRENDRE ICI** Rust Phase 4d — Slicer : Beats spinbox + génération MIDI via a3000_core::midi::generate_midi (Save MIDI to…)
 
 ## Moyen terme (Sprint)
 - [ ] Rust Phase 5 — Polish + design dark theme + packaging release
