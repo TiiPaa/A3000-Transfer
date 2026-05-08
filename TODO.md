@@ -24,7 +24,12 @@
 - [x] Rust Phase 4c — Slicer : Delete marked (rebuild audio + onsets) + audio playback cpal (resampling fixed-point 32.32 préserve la hauteur) + playhead animée + zoom (molette anchor curseur, factor 1.1×) + pan (drag souris OU Shift+molette) + navigation Space / Ctrl+Space par onset
 - [x] Rust Phase 4d — Slicer : Beats spinbox + Save MIDI button (a3000_core::midi::generate_midi → %TEMP%/a3000_slicer_midi/<stem>.mid) + ligne de message à hauteur fixe (allocate_exact_size, ne pousse pas la waveform)
 - [x] Rust Phase 4e — Slicer : drag-OUT MIDI vers DAW via OLE (#[implement] IDataObject + IDropSource + IEnumFORMATETC fournissant CF_HDROP, DoDragDrop synchrone)
-- [ ] **REPRENDRE ICI** Rust Phase 5 — Polish + design dark theme + packaging release
+- [x] Rust Phase 5a — Icône Windows embedded via winres (build.rs) + metadata FileVersion/CompanyName/ProductName
+- [x] Rust Phase 5b — Profile release optimisé (lto=true + codegen-units=1 + strip=symbols + panic=abort) → binaire 7.1 → 5.8 MB
+- [x] Rust Phase 5c — 55 tests OK en release LTO (7 ipc + 18 smdi + 1 scsi + 9 wav + 3 midi + 17 onset)
+
+**🎉 PORT RUST COMPLET — 5 phases terminées.** Binaire 5.8 MB (vs 311 MB Python).
+Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python portés et validés.
 
 ## Moyen terme (Sprint)
 

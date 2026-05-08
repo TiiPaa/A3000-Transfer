@@ -50,9 +50,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 Status :
 - ✅ Phase 1 — `a3000-core` complet (`smdi` / `wav` / `midi` / `scsi` / `transfer`), oracles bit-à-bit Python, validé bout-en-bout sur Yamaha A3000 réel
 - ✅ Phase 2 — `a3000-onset` : port librosa.onset_detect (STFT/Mel/flux/peak/backtrack + wrapper engine.py:detect_transients). 17 tests passent. A/B vs Python : 150/150 onsets matched ≤1 frame (100%) sur 5 WAVs (synthétique + 3 drum loops + reese).
-- 🚧 Phase 3 — `a3000-app` : scaffolding fait (eframe shell + 3 tabs + theme dark + IPC + worker process + UAC). Wiring Upload/Download au WorkerClient + tables détaillées = TODO.
-- 🚧 Phase 4 — Slicer egui + drag-out OLE MIDI — TODO
-- 🚧 Phase 5 — Polish + design + packaging — TODO
+- ✅ Phase 3 — `a3000-app` : eframe shell + 3 tabs (Upload/Download/Slicer) + theme dark + IPC types Cmd/Event + worker process port _worker.py + UAC via ShellExecuteExW. Tabs Upload (drag-IN WAV + table colonnes alignées + batch via WorkerSender + progress live) et Download (Scan + ListSamples + Receive batch) câblés bout-en-bout.
+- ✅ Phase 4 — `a3000-app::tabs::slicer` : drop WAV → load_wave → mono f32 → auto-détection via a3000-onset → custom waveform widget (peaks min/max par pixel, style 8-bit) + onset markers + selection cells + drag onsets + Delete marked (rebuild audio + onsets) + playback cpal (resampling fixed-point 32.32 préserve la hauteur, position lock-free via AtomicU64) + playhead animée + zoom (molette anchor curseur) + pan (drag souris ou Shift+molette) + nav clavier Space/Ctrl+Space + Save MIDI (a3000_core::midi) + drag-OUT OLE vers DAW (#[implement] IDataObject + IDropSource + IEnumFORMATETC fournissant CF_HDROP).
+- ✅ Phase 5 — Icône Windows embedded via winres (build.rs) + metadata FileVersion/CompanyName/ProductName, profile release optimisé (lto=true + codegen-units=1 + strip=symbols + panic=abort) → binaire **5.8 MB** (vs 311 MB Python = **54× plus léger**).
 
 Plan complet : `C:\Users\baboost\.claude\plans\peppy-zooming-knuth.md`
 Conversion docs : `docs/conversion/{INVENTORY,MAPPING,DECISIONS}.md`

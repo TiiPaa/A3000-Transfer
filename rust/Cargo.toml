@@ -79,3 +79,16 @@ windows = { version = "0.58", features = [
 ] }
 # Tests
 tempfile = "3"
+
+# Profile release : optimisé pour la taille finale + perf au démarrage.
+# - lto=true     : link-time optimization (réduit la taille + inline cross-crate)
+# - codegen-units=1 : meilleure opt globale (build plus lent, ok en CI)
+# - opt-level=3  : max perf (défaut release, explicite ici)
+# - strip="symbols" : retire les symboles de debug du binaire final
+# - panic="abort" : pas de tables d'unwinding (réduit la taille ; nos deps OK)
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"
