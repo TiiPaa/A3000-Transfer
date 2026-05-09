@@ -57,7 +57,7 @@ fn footer(ui: &mut egui::Ui) {
     let bg = egui::Color32::from_rgb(60, 30, 30);
     egui::Frame::none().fill(bg).inner_margin(egui::Margin::same(6.0)).show(ui, |ui| {
         ui.label(egui::RichText::new("=== FOOTER (rouge sombre) ===").color(egui::Color32::WHITE));
-        ui.button("Send / Reset / etc.");
+        let _ = ui.button("Send / Reset / etc.");
     });
 }
 
@@ -78,7 +78,7 @@ fn approach_a(ui: &mut egui::Ui) {
     ui.allocate_ui(block_size, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
-            .show(ui, |ui| rows(ui));
+            .show(ui, rows);
     });
     // Bordure rouge autour du rect alloué (visualisation)
     let last_rect = ui.min_rect();

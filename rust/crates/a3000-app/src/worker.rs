@@ -106,7 +106,8 @@ fn dispatch(
     log_path: &Path,
 ) -> anyhow::Result<()> {
     let ha = match cmd {
-        Cmd::FindFreeSlot { ha, .. }
+        Cmd::Probe { ha, .. }
+        | Cmd::FindFreeSlot { ha, .. }
         | Cmd::ListSamples { ha, .. }
         | Cmd::Receive { ha, .. }
         | Cmd::Transfer { ha, .. } => *ha,
@@ -122,6 +123,21 @@ fn dispatch(
     let mut w = writer.try_clone()?;
 
     match cmd {
+        Cmd::Probe { bus, target, lun, .. } => {
+            use a3000_core::smdi::{master_identify_message, MSG_SLAVE_IDENTIFY};
+            let target = ScsiTarget { path_id: *bus, target_id: *target, lun: *lun };
+            let _ = transfer::drain_pending_reply(h, target);
+            transfer::send_smdi(h, target, &master_identify_message(), 5)?;
+            let (_, reply) = transfer::receive_smdi(h, target, 64, 5)?;
+            if reply.code() != MSG_SLAVE_IDENTIFY {
+                anyhow::bail!(
+                    "Le device sur HA{} BUS{} ID{} LUN{} a répondu 0x{:04X}/0x{:04X} (Slave Identify attendu)",
+                    ha, bus, target.target_id, target.lun, reply.message_id, reply.sub_id,
+                );
+            }
+            send_event(&mut w, &Event::ProbeOk)?;
+        }
+
         Cmd::FindFreeSlot { bus, target, lun, start, .. } => {
             let target = ScsiTarget { path_id: *bus, target_id: *target, lun: *lun };
             let slot = find_first_free_sample(h, target, *start, 256)?;

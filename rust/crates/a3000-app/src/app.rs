@@ -70,7 +70,23 @@ pub struct A3000App {
     pub slicer: tabs::slicer::SlicerState,
     pub status: String,
     pub worker: WorkerState,
+    pub device: DeviceStatus,
     pub settings_open: bool,
+}
+
+/// État du device SCSI cible — orthogonal à `WorkerState` (qui est l'état TCP
+/// du worker). Le worker peut être connecté sans qu'un sampler ne réponde.
+#[derive(Default, Debug, Clone)]
+pub enum DeviceStatus {
+    /// Pas encore sondé (worker pas connecté, ou avant le 1er probe).
+    #[default]
+    Unknown,
+    /// Probe envoyé, en attente de la réponse.
+    Probing,
+    /// Slave Identify reçu — sampler répond.
+    Available,
+    /// Probe échoué (open SCSI, pas de réponse, mauvais target, etc.).
+    Unavailable(String),
 }
 
 impl A3000App {
@@ -87,8 +103,27 @@ impl A3000App {
             worker: WorkerState::Idle,
             #[cfg(not(windows))]
             worker: WorkerState::Unsupported,
+            device: DeviceStatus::Unknown,
             settings_open: false,
         }
+    }
+
+    /// Envoie un Cmd::Probe au worker pour vérifier le sampler à l'adresse
+    /// configurée. Met `device` à Probing en attendant la réponse.
+    #[cfg(windows)]
+    fn send_probe(&mut self) {
+        let WorkerState::Connected(handle) = &self.worker else { return; };
+        let cmd = Cmd::Probe {
+            ha: self.config.ha,
+            bus: self.config.bus,
+            target: self.config.target,
+            lun: self.config.lun,
+        };
+        if let Err(e) = handle.sender().send_cmd(&cmd) {
+            self.device = DeviceStatus::Unavailable(format!("send probe: {e}"));
+            return;
+        }
+        self.device = DeviceStatus::Probing;
     }
 
     /// Lance la connexion au worker élevé (non-bloquant : popup UAC + accept
@@ -131,11 +166,20 @@ impl A3000App {
         };
         if let Some(s) = new_state {
             match &s {
-                WorkerState::Connected(_) => self.status = "Worker élevé connecté.".into(),
-                WorkerState::Error(e) => self.status = format!("Worker : {e}"),
-                _ => {}
+                WorkerState::Connected(_) => {
+                    self.status = "Worker connecté, sondage du sampler…".into();
+                    self.worker = s;
+                    // Auto-probe : vérifie qu'un sampler répond bien à
+                    // l'adresse configurée.
+                    self.send_probe();
+                }
+                WorkerState::Error(e) => {
+                    self.status = format!("Worker : {e}");
+                    self.device = DeviceStatus::Unknown;
+                    self.worker = s;
+                }
+                _ => self.worker = s,
             }
-            self.worker = s;
         }
 
         // Drain events si connecté (collect d'abord, dispatch ensuite pour
@@ -159,6 +203,14 @@ impl A3000App {
     fn on_event(&mut self, event: Event) {
         match event {
             Event::Ready => self.status = "Worker ready".into(),
+            Event::ProbeOk => {
+                self.device = DeviceStatus::Available;
+                self.status = format!(
+                    "Sampler détecté (HA{} BUS{} ID{} LUN{})",
+                    self.config.ha, self.config.bus,
+                    self.config.target, self.config.lun,
+                );
+            }
             Event::FreeSlot { slot } => {
                 self.status = format!("1er slot libre = #{slot}");
                 if self.upload.pending_find_slot {
@@ -197,6 +249,11 @@ impl A3000App {
             }
             Event::Error { msg, .. } => {
                 self.status = format!("× {msg}");
+                // Si on était en train de sonder le sampler, l'erreur
+                // signifie que le device n'est pas joignable.
+                if matches!(self.device, DeviceStatus::Probing) {
+                    self.device = DeviceStatus::Unavailable(msg.clone());
+                }
                 if let Some(idx) = self.upload.current_idx.take() {
                     if let Some(it) = self.upload.items.get_mut(idx) {
                         it.state = UploadItemState::Error;
@@ -554,9 +611,31 @@ impl eframe::App for A3000App {
                         self.config.target, self.config.lun,
                     ));
                     ui.separator();
-                    // Worker status + bouton connect
+                    // Worker status + device status + bouton connect
                     #[cfg(windows)]
                     {
+                        // Device status (rendu en 1er → flush right grâce au layout
+                        // right_to_left).
+                        if matches!(self.worker, WorkerState::Connected(_)) {
+                            let (txt, color) = match &self.device {
+                                DeviceStatus::Unknown =>
+                                    ("Sampler : ?".to_string(), palette::FG_DIM),
+                                DeviceStatus::Probing =>
+                                    ("Sampler : sondage…".to_string(), palette::ACCENT_YELLOW),
+                                DeviceStatus::Available =>
+                                    ("Sampler : OK".to_string(), palette::ACCENT_GREEN),
+                                DeviceStatus::Unavailable(msg) =>
+                                    (format!("Sampler : non détecté ({msg})"), palette::ACCENT_RED),
+                            };
+                            let resp = ui.label(egui::RichText::new(&txt).color(color));
+                            if matches!(self.device, DeviceStatus::Unavailable(_)) {
+                                resp.on_hover_text(
+                                    "Cliquer Connect → pour réessayer après avoir branché \
+                                     le sampler ou ajusté les Settings (HA/BUS/ID/LUN).",
+                                );
+                            }
+                            ui.separator();
+                        }
                         let label = self.worker.label();
                         let color = self.worker.color();
                         ui.label(egui::RichText::new(&label).color(color));
@@ -564,6 +643,14 @@ impl eframe::App for A3000App {
                             && ui.button("Connect…").clicked()
                         {
                             self.start_worker(ctx);
+                        }
+                        // Si connecté mais sampler indisponible, bouton "Probe"
+                        // pour refaire un test après ajustement Settings ou hardware.
+                        if matches!(self.worker, WorkerState::Connected(_))
+                            && matches!(self.device, DeviceStatus::Unavailable(_) | DeviceStatus::Unknown)
+                            && ui.button("Probe").clicked()
+                        {
+                            self.send_probe();
                         }
                     }
                 });

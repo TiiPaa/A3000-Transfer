@@ -33,6 +33,14 @@
 Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python portés et validés.
 
 - [x] Bug UI overlap rows / header / footer : la helper `cell()` faisait `child.set_clip_rect(rect)` qui REMPLACE le clip parent au lieu d'INTERSECTER. Pour les rows hors-viewport ScrollArea, le clip viewport hérité était écrasé → la cellule pouvait peindre partout dans son rect propre, y compris par-dessus header/footer. Fix : `child.set_clip_rect(rect.intersect(ui.clip_rect()))`. (Diagnostic : `examples/scroll_repro.rs` montrait que les patterns externes — TopBottomPanel, allocate_ui, child_ui — fonctionnaient en isolation, donc le bug était au niveau plus bas.)
+- [x] Auto-probe SMDI (Master Identify → Slave Identify) après UAC connect : top bar affiche `Sampler : sondage… / OK / non détecté (msg)` + bouton `Probe` pour relancer après ajustement Settings ou hardware
+- [x] Slicer footer 2 lignes (info / boutons) ; spinbox `Beats` placé à côté des boutons MIDI ; couleur `BUTTON_MIDI` (cuivre/ambre) plus douce que `ACCENT_YELLOW`
+- [x] Tokens design centralisés dans `theme.rs` (`palette` étendu BUTTON_PRIMARY/MIDI/DANGER/BUSY, `size`, `font`, `space`)
+- [x] Slicer cells selectors alignés sur la sémantique Python : `selected: Vec<bool>` (vert, à garder pour export, mode filter) + `marked: Vec<bool>` (rouge, à supprimer) mutuellement exclusifs ; click gauche/drag → selected, click droit/drag → marked
+- [x] Slicer : click sur la waveform (hors d'un onset) → preview de la slice en oneshot ; pas de playhead pendant un preview ; cellule highlight au contour jaune
+- [x] Upload : import drag-IN d'archives `.zip` / `.tar.gz` / `.tgz` / `.tar` (module `archive.rs` + crates `zip`, `flate2`, `tar`) — extraction dans `%TEMP%\a3000_extracted\<stem>_<pid>_<nano>\`, walk récursif, ajout des `.wav` à la queue
+- [x] Module `audio.rs` partagé Slicer ↔ Upload (`Playback::start_loop` / `start_oneshot` + `pcm16_le_to_mono_f32`)
+- [x] Upload : preview audio par item — bouton play/stop par row (icône peinte triangle/carré pour centrage pixel-perfect, glyphs Unicode `▶`/`■` ont des galleys asymétriques) à droite du Sample name ; row highlight jaune pendant la lecture ; oneshot, stop auto à la fin
 
 ## Moyen terme (Sprint)
 

@@ -23,16 +23,14 @@
 #![allow(dead_code)] // wiring complet à venir Phase 4c-e
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 
 use a3000_core::midi::generate_midi;
-use a3000_core::wav::{load_wave, WaveError, WavePayload};
+use a3000_core::wav::{load_wave, WaveError};
 use a3000_onset::{detect_transients, DetectOptions};
 
+use crate::audio::{pcm16_le_to_mono_f32, Playback};
 use crate::theme::palette;
 
 #[derive(Default)]
@@ -40,8 +38,13 @@ pub struct SlicerState {
     pub source_path: Option<PathBuf>,
     pub audio: Option<AudioData>,
     pub onsets: Vec<usize>,
-    /// Une entrée par slice (= par onset). `true` = marqué pour suppression.
+    /// Une entrée par slice. `true` = marqué pour suppression (rouge).
+    /// Mutuellement exclusif avec `selected`.
     pub marked: Vec<bool>,
+    /// Une entrée par slice. `true` = sélectionné pour export (vert).
+    /// Mutuellement exclusif avec `marked`. Si non vide, `Send to Upload`
+    /// n'exporte QUE les slices sélectionnées (mode "filter").
+    pub selected: Vec<bool>,
     pub n_beats: u32,
     pub error: Option<String>,
     /// Cache des bins de peaks. Invalidé quand la largeur du widget change.
@@ -60,11 +63,26 @@ pub struct SlicerState {
     /// Drag-select : slice idx où le drag a commencé + valeur cible.
     drag_select_start: Option<usize>,
     drag_select_target: bool,
+    /// Drag-select : opère sur `selected` (left) ou `marked` (right).
+    drag_select_kind: DragKind,
     /// Playback en cours (audio output stream cpal). Drop le stream pour stop.
     /// `cpal::Stream` est `!Send` sur Windows → vit sur le thread GUI.
     playback: Option<Playback>,
+    /// Si une preview de slice est en cours, l'index de la slice (None pour
+    /// le Loop full audio). Sert à highlight la cellule sans dessiner de
+    /// playhead (qui n'aurait pas de sens : le playback joue un buffer
+    /// extrait, pas le buffer global).
+    previewing_slice: Option<usize>,
     /// Fenêtre visible sur la waveform (zoom + pan). [start, end) en samples.
     view: ViewWindow,
+}
+
+/// Distinguer un drag click-gauche (selected) d'un drag click-droit (marked).
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    #[default]
+    Selected,
+    Marked,
 }
 
 /// Fenêtre visible : intervalle [start, end) de samples du buffer audio.
@@ -106,123 +124,8 @@ struct PeaksCache {
     bins: Vec<(f32, f32)>,
 }
 
-/// Audio output stream cpal en boucle infinie sur le buffer mono.
-///
-/// Resampling linéaire fixed-point (32.32) du source SR vers le device SR
-/// pour préserver la hauteur. Position partagée via `AtomicU64` (lockfree)
-/// pour que la GUI puisse lire la playhead sans bloquer le callback audio.
-struct Playback {
-    /// Le stream est dropped pour stop.
-    _stream: cpal::Stream,
-    /// Position fixed-point 32.32 dans le buffer source (en samples × 2^32).
-    position_fixed: Arc<AtomicU64>,
-    /// Longueur du buffer source (samples).
-    audio_len: usize,
-}
-
-const FIX_SHIFT: u64 = 32;
-
-impl Playback {
-    fn start(audio_mono: Vec<f32>, source_sr: u32) -> Result<Self, anyhow::Error> {
-        let host = cpal::default_host();
-        let device = host.default_output_device()
-            .ok_or_else(|| anyhow::anyhow!("Aucun device de sortie audio par défaut"))?;
-        let supported = device.default_output_config()
-            .map_err(|e| anyhow::anyhow!("default_output_config: {e}"))?;
-        let n_channels = supported.channels() as usize;
-        let device_sr = supported.sample_rate().0;
-        let sample_format = supported.sample_format();
-        let stream_config: cpal::StreamConfig = supported.into();
-
-        let audio_len = audio_mono.len();
-        let audio = Arc::new(audio_mono);
-        let position_fixed = Arc::new(AtomicU64::new(0));
-
-        // step = (source_sr / device_sr) en fixed-point 32.32
-        let step: u64 = ((source_sr as u64) << FIX_SHIFT) / device_sr.max(1) as u64;
-
-        let audio_clone = Arc::clone(&audio);
-        let pos_clone = Arc::clone(&position_fixed);
-        // total_fixed = audio_len << 32 ; clamp pour éviter overflow si audio_len > 2^32 (impossible en pratique : >24h à 48k).
-        let total_fixed = (audio_len as u64).checked_shl(FIX_SHIFT as u32).unwrap_or(u64::MAX);
-
-        let err_fn = |err| eprintln!("cpal stream err: {err}");
-
-        let stream = match sample_format {
-            cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |output: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                    if audio_clone.is_empty() || total_fixed == 0 {
-                        output.fill(0.0);
-                        return;
-                    }
-                    let n_frames = output.len() / n_channels.max(1);
-                    let mut pos = pos_clone.load(Ordering::Relaxed);
-                    let mask = (1u64 << FIX_SHIFT) - 1;
-                    let inv_one: f32 = 1.0 / ((1u64 << FIX_SHIFT) as f64) as f32;
-                    for f in 0..n_frames {
-                        let i0 = (pos >> FIX_SHIFT) as usize;
-                        let frac = (pos & mask) as f32 * inv_one;
-                        let i1 = (i0 + 1) % audio_len;
-                        let s = audio_clone[i0] * (1.0 - frac) + audio_clone[i1] * frac;
-                        for c in 0..n_channels {
-                            output[f * n_channels + c] = s;
-                        }
-                        pos = pos.wrapping_add(step);
-                        if pos >= total_fixed { pos -= total_fixed; }
-                    }
-                    pos_clone.store(pos, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => device.build_output_stream(
-                &stream_config,
-                move |output: &mut [i16], _info: &cpal::OutputCallbackInfo| {
-                    if audio_clone.is_empty() || total_fixed == 0 {
-                        output.fill(0);
-                        return;
-                    }
-                    let n_frames = output.len() / n_channels.max(1);
-                    let mut pos = pos_clone.load(Ordering::Relaxed);
-                    let mask = (1u64 << FIX_SHIFT) - 1;
-                    let inv_one: f32 = 1.0 / ((1u64 << FIX_SHIFT) as f64) as f32;
-                    for f in 0..n_frames {
-                        let i0 = (pos >> FIX_SHIFT) as usize;
-                        let frac = (pos & mask) as f32 * inv_one;
-                        let i1 = (i0 + 1) % audio_len;
-                        let s = audio_clone[i0] * (1.0 - frac) + audio_clone[i1] * frac;
-                        let s16 = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        for c in 0..n_channels {
-                            output[f * n_channels + c] = s16;
-                        }
-                        pos = pos.wrapping_add(step);
-                        if pos >= total_fixed { pos -= total_fixed; }
-                    }
-                    pos_clone.store(pos, Ordering::Relaxed);
-                },
-                err_fn,
-                None,
-            )?,
-            other => anyhow::bail!("Format audio non supporté : {:?}", other),
-        };
-        stream.play()?;
-
-        Ok(Self {
-            _stream: stream,
-            position_fixed,
-            audio_len,
-        })
-    }
-
-    /// Position de lecture courante en fraction [0, 1] du buffer.
-    fn position_fraction(&self) -> f32 {
-        if self.audio_len == 0 { return 0.0; }
-        let pos = self.position_fixed.load(Ordering::Relaxed);
-        let pos_int = (pos >> FIX_SHIFT) as usize;
-        (pos_int as f32 / self.audio_len as f32).clamp(0.0, 1.0)
-    }
-}
+// `Playback` et `pcm16_le_to_mono_f32` sont dans `crate::audio` (partagé
+// avec le tab Upload pour la preview WAV).
 
 impl SlicerState {
     pub fn load(&mut self, path: PathBuf) {
@@ -230,25 +133,30 @@ impl SlicerState {
         self.peaks_cache = None;
         self.onsets.clear();
         self.marked.clear();
+        self.selected.clear();
         self.dragging_onset = None;
         self.dragging_pan = None;
         self.drag_select_start = None;
         self.current_onset = None;
         self.playback = None;
+        self.previewing_slice = None;
         self.view = ViewWindow::default();
         match load_wave(&path) {
             Ok(payload) => {
-                let audio = pcm16_le_to_mono_f32(&payload);
-                let duration_s = audio.mono.len() as f64 / audio.sample_rate.max(1) as f64;
+                let mono = pcm16_le_to_mono_f32(&payload);
+                let sample_rate = payload.sample_rate;
+                let channels = payload.channels.max(1);
+                let mono_len = mono.len();
+                let duration_s = mono_len as f64 / sample_rate.max(1) as f64;
                 let opts = DetectOptions::default();
-                self.onsets = detect_transients(&audio.mono, audio.sample_rate, &opts);
+                self.onsets = detect_transients(&mono, sample_rate, &opts);
                 self.marked = vec![false; self.onsets.len()];
+                self.selected = vec![false; self.onsets.len()];
                 self.source_path = Some(path);
-                let mono_len = audio.mono.len();
                 self.audio = Some(AudioData {
-                    sample_rate: audio.sample_rate,
-                    channels: audio.channels,
-                    mono: audio.mono,
+                    sample_rate,
+                    channels,
+                    mono,
                     duration_s,
                 });
                 self.view = ViewWindow { start: 0, end: mono_len };
@@ -274,6 +182,25 @@ impl SlicerState {
 
     pub fn marked_count(&self) -> usize {
         self.marked.iter().filter(|&&m| m).count()
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|&&m| m).count()
+    }
+
+    /// Mutuellement exclusif : marquer une slice désélectionne et inversement.
+    fn set_selected(&mut self, idx: usize, value: bool) {
+        if let Some(s) = self.selected.get_mut(idx) { *s = value; }
+        if value {
+            if let Some(m) = self.marked.get_mut(idx) { *m = false; }
+        }
+    }
+
+    fn set_marked(&mut self, idx: usize, value: bool) {
+        if let Some(m) = self.marked.get_mut(idx) { *m = value; }
+        if value {
+            if let Some(s) = self.selected.get_mut(idx) { *s = false; }
+        }
     }
 
     /// Reconstruit le buffer audio en concaténant les slices NON marquées,
@@ -310,6 +237,7 @@ impl SlicerState {
 
         self.onsets = new_onsets;
         self.marked = vec![false; self.onsets.len()];
+        self.selected = vec![false; self.onsets.len()];
         self.peaks_cache = None;
         self.dragging_onset = None;
         self.dragging_pan = None;
@@ -318,6 +246,7 @@ impl SlicerState {
         // L'audio buffer du Playback est cloné au moment de start ; on coupe
         // pour rester cohérent avec le nouveau contenu visible.
         self.playback = None;
+        self.previewing_slice = None;
         self.view = ViewWindow { start: 0, end: audio.mono.len() };
     }
 
@@ -378,11 +307,25 @@ impl SlicerState {
             sample_format: hound::SampleFormat::Int,
         };
 
+        // Sémantique d'export (port Python view.py) :
+        //   - Si au moins une slice est SELECTED (vert) → export = SEULEMENT
+        //     les selected (mode "filter").
+        //   - Sinon → export = TOUT sauf les marked (rouge).
+        let any_selected = self.selected.iter().any(|&s| s);
+
         let mut paths: Vec<PathBuf> = Vec::new();
         for (i, &start) in self.onsets.iter().enumerate() {
             let end = self.onsets.get(i + 1).copied().unwrap_or(total).min(total);
-            if start >= end || self.marked.get(i).copied().unwrap_or(false) {
-                continue; // slice marquée pour suppression : ignorée
+            if start >= end {
+                continue;
+            }
+            let include = if any_selected {
+                self.selected.get(i).copied().unwrap_or(false)
+            } else {
+                !self.marked.get(i).copied().unwrap_or(false)
+            };
+            if !include {
+                continue;
             }
             let path = dir.join(format!(
                 "{safe_stem}_slice_{:0width$}.wav", i + 1, width = n_digits,
@@ -478,16 +421,58 @@ impl SlicerState {
     pub fn toggle_playback(&mut self) {
         if self.playback.is_some() {
             self.playback = None;
+            self.previewing_slice = None;
             return;
         }
         let Some(audio) = self.audio.as_ref() else { return; };
-        match Playback::start(audio.mono.clone(), audio.sample_rate) {
-            Ok(p) => self.playback = Some(p),
+        match Playback::start_loop(audio.mono.clone(), audio.sample_rate) {
+            Ok(p) => {
+                self.playback = Some(p);
+                self.previewing_slice = None; // Loop full = pas de slice spécifique
+            }
             Err(e) => self.error = Some(format!("Playback : {e}")),
         }
     }
 
-    pub fn stop_playback(&mut self) { self.playback = None; }
+    pub fn stop_playback(&mut self) {
+        self.playback = None;
+        self.previewing_slice = None;
+    }
+
+    /// Joue la slice contenant le sample `pos` (lecture one-shot, pas en boucle).
+    /// Stop la lecture en cours si elle existe. La cellule correspondante
+    /// est mise en surbrillance via `previewing_slice`.
+    pub fn play_slice_at_sample(&mut self, pos: usize) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let Some(idx) = self.slice_at_sample(pos) else { return; };
+        let total = audio.mono.len();
+        let start = self.onsets[idx];
+        let end = self.onsets.get(idx + 1).copied().unwrap_or(total).min(total);
+        if start >= end { return; }
+        let slice: Vec<f32> = audio.mono[start..end].to_vec();
+        let sr = audio.sample_rate;
+        self.playback = None;
+        match Playback::start_oneshot(slice, sr) {
+            Ok(p) => {
+                self.playback = Some(p);
+                self.previewing_slice = Some(idx);
+            }
+            Err(e) => self.error = Some(format!("× preview : {e}")),
+        }
+    }
+
+    /// Détecte qu'une preview oneshot est arrivée à sa fin et nettoie l'état.
+    /// À appeler en début de frame (avant le rendu).
+    fn poll_preview_end(&mut self) {
+        if self.previewing_slice.is_some() {
+            if let Some(pb) = &self.playback {
+                if pb.position_fraction() >= 1.0 - 1e-3 {
+                    self.playback = None;
+                    self.previewing_slice = None;
+                }
+            }
+        }
+    }
 
     /// slice_idx tel que `onsets[idx] <= sample < onsets[idx+1]`.
     fn slice_at_sample(&self, sample: usize) -> Option<usize> {
@@ -504,32 +489,6 @@ impl SlicerState {
 
 fn format_wav_err(e: &WaveError) -> String { format!("× WAV : {e}") }
 
-fn pcm16_le_to_mono_f32(payload: &WavePayload) -> AudioData {
-    let channels = payload.channels.max(1);
-    let frames = payload.frame_count as usize;
-    let inv_max = 1.0 / 32768.0_f32;
-    let inv_n = 1.0 / channels as f32;
-    let mut mono = Vec::with_capacity(frames);
-    let data = &payload.pcm_data;
-    for f in 0..frames {
-        let mut sum = 0.0_f32;
-        for c in 0..channels as usize {
-            let off = (f * channels as usize + c) * 2;
-            if off + 1 < data.len() {
-                let s = i16::from_le_bytes([data[off], data[off + 1]]);
-                sum += (s as f32) * inv_max;
-            }
-        }
-        mono.push(sum * inv_n);
-    }
-    AudioData {
-        sample_rate: payload.sample_rate,
-        channels,
-        mono,
-        duration_s: 0.0,
-    }
-}
-
 fn drain_dropped_wav(ctx: &egui::Context) -> Option<PathBuf> {
     ctx.input(|i| {
         i.raw.dropped_files.iter()
@@ -545,7 +504,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
     if let Some(path) = drain_dropped_wav(ui.ctx()) {
         state.load(path);
     }
-    // Pendant la lecture, repaint régulier pour l'animation de la playhead.
+    // Détecte la fin d'une preview oneshot (slice) avant le rendu.
+    state.poll_preview_end();
+    // Pendant la lecture, repaint régulier pour l'animation de la playhead /
+    // pour détecter la fin d'une preview oneshot.
     if state.is_playing() {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
@@ -596,7 +558,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
 
     // Bloc canvas cadré strictement (allocate_exact_size + child_ui +
     // set_clip_rect) — cohérent avec upload/download.
-    const FOOTER_RESERVED_H: f32 = 70.0;
+    // Footer slicer = 2 lignes (info + spinbox Beats / boutons) + séparateur.
+    const FOOTER_RESERVED_H: f32 = 110.0;
     let block_h = (ui.available_height() - FOOTER_RESERVED_H).max(100.0);
     let block_size = egui::vec2(ui.available_width(), block_h);
     let (block_rect, _) = ui.allocate_exact_size(block_size, egui::Sense::hover());
@@ -774,46 +737,78 @@ fn handle_cells_interaction(
     if state.audio.is_none() { return; }
     let view = state.view;
 
-    let pointer_pos_to_slice = |p: egui::Pos2| -> Option<usize> {
+    // Helper inline (function pointer pour éviter le double borrow de state).
+    fn slice_at(state: &SlicerState, view: ViewWindow, rect: egui::Rect, p: egui::Pos2) -> Option<usize> {
         if !rect.x_range().contains(p.x) { return None; }
-        let sample = view.x_to_sample(p.x, *rect);
+        let sample = view.x_to_sample(p.x, rect);
         state.slice_at_sample(sample)
-    };
+    }
 
-    if resp.drag_started() {
+    use egui::PointerButton::{Primary, Secondary};
+
+    // === DRAG START : capture la cellule + l'opération (selected/marked) ===
+    let primary_drag_start = resp.drag_started_by(Primary);
+    let secondary_drag_start = resp.drag_started_by(Secondary);
+    if primary_drag_start || secondary_drag_start {
         if let Some(p) = resp.interact_pointer_pos() {
-            if let Some(idx) = pointer_pos_to_slice(p) {
+            if let Some(idx) = slice_at(state, view, *rect, p) {
                 state.drag_select_start = Some(idx);
-                let cur = state.marked.get(idx).copied().unwrap_or(false);
-                state.drag_select_target = !cur;
-                if let Some(m) = state.marked.get_mut(idx) {
-                    *m = state.drag_select_target;
+                if primary_drag_start {
+                    state.drag_select_kind = DragKind::Selected;
+                    let cur = state.selected.get(idx).copied().unwrap_or(false);
+                    state.drag_select_target = !cur;
+                    state.set_selected(idx, state.drag_select_target);
+                } else {
+                    state.drag_select_kind = DragKind::Marked;
+                    let cur = state.marked.get(idx).copied().unwrap_or(false);
+                    state.drag_select_target = !cur;
+                    state.set_marked(idx, state.drag_select_target);
                 }
             }
         }
-    } else if resp.dragged() {
+    }
+
+    // === DRAG CONTINUATION : étend l'opération sur les cells visitées ===
+    if resp.dragged_by(Primary) || resp.dragged_by(Secondary) {
         if let Some(start) = state.drag_select_start {
             if let Some(p) = resp.interact_pointer_pos() {
-                if let Some(cur_idx) = pointer_pos_to_slice(p) {
+                if let Some(cur_idx) = slice_at(state, view, *rect, p) {
                     let (lo, hi) = if cur_idx < start { (cur_idx, start) }
                                    else { (start, cur_idx) };
+                    let target = state.drag_select_target;
+                    let kind = state.drag_select_kind;
                     for i in lo..=hi {
-                        if let Some(m) = state.marked.get_mut(i) {
-                            *m = state.drag_select_target;
+                        match kind {
+                            DragKind::Selected => state.set_selected(i, target),
+                            DragKind::Marked => state.set_marked(i, target),
                         }
                     }
                 }
             }
         }
-    } else if resp.drag_stopped() {
+    }
+
+    // === DRAG END ===
+    if resp.drag_stopped_by(Primary) || resp.drag_stopped_by(Secondary) {
         state.drag_select_start = None;
-    } else if resp.clicked() {
-        // Click simple sans drag : toggle juste la cell sous le curseur.
+    }
+
+    // === CLICK SIMPLE (sans drag) ===
+    // Click gauche → toggle selected (vert, à garder pour export).
+    // Click droit  → toggle marked  (rouge, à supprimer).
+    if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            if let Some(idx) = pointer_pos_to_slice(p) {
-                if let Some(m) = state.marked.get_mut(idx) {
-                    *m = !*m;
-                }
+            if let Some(idx) = slice_at(state, view, *rect, p) {
+                let cur = state.selected.get(idx).copied().unwrap_or(false);
+                state.set_selected(idx, !cur);
+            }
+        }
+    }
+    if resp.clicked_by(Secondary) {
+        if let Some(p) = resp.interact_pointer_pos() {
+            if let Some(idx) = slice_at(state, view, *rect, p) {
+                let cur = state.marked.get(idx).copied().unwrap_or(false);
+                state.set_marked(idx, !cur);
             }
         }
     }
@@ -843,12 +838,32 @@ fn paint_cells(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
             egui::pos2(x0 + 1.0, rect.top() + 2.0),
             egui::pos2(x1 - 1.0, rect.bottom() - 2.0),
         );
+        let selected = state.selected.get(i).copied().unwrap_or(false);
         let marked = state.marked.get(i).copied().unwrap_or(false);
-        let fill = if marked { palette::ACCENT_GREEN } else { palette::BG_PANEL };
+        let previewing = state.previewing_slice == Some(i);
+        let fill = if selected {
+            palette::ACCENT_GREEN  // à garder pour export
+        } else if marked {
+            palette::ACCENT_RED    // à supprimer
+        } else {
+            palette::BG_PANEL
+        };
         painter.rect_filled(cell, 1.5, fill);
+        // Surbrillance jaune épaisse autour de la slice en cours de preview.
+        if previewing {
+            painter.rect_stroke(
+                cell,
+                1.5,
+                egui::Stroke::new(2.5, palette::ACCENT_YELLOW),
+            );
+        }
 
         if cell.width() >= 24.0 {
-            let txt_color = if marked { egui::Color32::WHITE } else { palette::FG_DIM };
+            let txt_color = if selected || marked {
+                egui::Color32::WHITE
+            } else {
+                palette::FG_DIM
+            };
             painter.text(
                 cell.center(),
                 egui::Align2::CENTER_CENTER,
@@ -962,6 +977,21 @@ fn handle_waveform_interaction(
         state.dragging_onset = None;
         state.dragging_pan = None;
     }
+
+    // Click simple sur la waveform (sans drag) hors d'un onset → joue la slice
+    // sous le curseur. resp.clicked() ne fire que si le mouvement est resté
+    // sous le drag-threshold (~6 px), donc pas de conflit avec drag-onset/pan.
+    if resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let was_on_onset = state.onsets.iter().any(|&o| {
+                sample_to_x(o).map(|x| (x - p.x).abs() < ONSET_HIT_PX).unwrap_or(false)
+            });
+            if !was_on_onset {
+                let sample = x_to_sample(p.x);
+                state.play_slice_at_sample(sample);
+            }
+        }
+    }
 }
 
 fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
@@ -1010,16 +1040,21 @@ fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
         }
     }
 
-    // Playhead (lecture en cours) : ligne verticale orange épaisse.
-    if let Some(pb) = &state.playback {
-        if let Some(audio) = &state.audio {
-            let total = audio.mono.len();
-            let pos_sample = (pb.position_fraction() * total as f32) as usize;
-            if let Some(x) = view.sample_to_x(pos_sample, rect) {
-                painter.line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(2.0, palette::ACCENT_ORANGE),
-                );
+    // Playhead (Loop full audio uniquement). En preview de slice on ne
+    // dessine PAS la playhead — la position serait dans le buffer de la
+    // slice extraite, pas du buffer global. À la place, la cellule est
+    // highlight (cf. paint_cells).
+    if state.previewing_slice.is_none() {
+        if let Some(pb) = &state.playback {
+            if let Some(audio) = &state.audio {
+                let total = audio.mono.len();
+                let pos_sample = (pb.position_fraction() * total as f32) as usize;
+                if let Some(x) = view.sample_to_x(pos_sample, rect) {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(2.0, palette::ACCENT_ORANGE),
+                    );
+                }
             }
         }
     }
@@ -1029,27 +1064,71 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
     const BTN_H: f32 = 32.0;
     let total = state.slice_count();
     let marked = state.marked_count();
+    let selected = state.selected_count();
+    let has_audio = state.audio.is_some();
+    let has_slices = !state.onsets.is_empty();
+    // Nombre de slices qui seront exportées (sémantique Python) :
+    //   - si au moins une selected (vert) → seulement selected
+    //   - sinon → tout sauf marked (rouge)
+    let export_count = if selected > 0 { selected } else { total.saturating_sub(marked) };
+    let midi_enabled = has_audio && has_slices;
+
+    // Ligne 1 : compteurs sélection / suppression / total.
     ui.horizontal(|ui| {
         if total > 0 {
             ui.label(
                 egui::RichText::new(format!(
-                    "Marqués : {marked}/{total} — {} onsets",
+                    "{} onsets — sélectionnées (vert) : {selected}/{total} — marquées suppression (rouge) : {marked}/{total}",
                     state.onsets.len(),
                 )).color(palette::FG_DIM),
             );
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let has_audio = state.audio.is_some();
-            let has_slices = !state.onsets.is_empty();
-            let unmarked = state.slice_count().saturating_sub(state.marked_count());
+    });
 
-            // Send to Upload — action primaire (verte) flush right. Pas de
-            // glyph Unicode (→ U+2192 n'est pas dans la font egui par défaut).
+    ui.add_space(2.0);
+
+    // Ligne 2 : tous les boutons d'action.
+    ui.horizontal(|ui| {
+        // Slice management (gauche → droite : Reset, Delete, None, Select all).
+        if ui.add_enabled_ui(has_audio, |ui| {
+            ui.add_sized([100.0, BTN_H], egui::Button::new("Reset"))
+        }).inner.clicked() {
+            state.reset();
+        }
+        let delete_btn = egui::Button::new(
+            egui::RichText::new(format!("Delete {marked}")).color(egui::Color32::WHITE),
+        ).fill(palette::ACCENT_RED);
+        if ui.add_enabled_ui(has_audio && marked > 0 && marked < total, |ui| {
+            ui.add_sized([110.0, BTN_H], delete_btn)
+        }).inner.clicked() {
+            state.delete_marked();
+        }
+        // None — décoche tout (selected ET marked).
+        if ui.add_enabled_ui(has_audio && (selected > 0 || marked > 0), |ui| {
+            ui.add_sized([80.0, BTN_H], egui::Button::new("None"))
+        }).inner.clicked() {
+            for s in &mut state.selected { *s = false; }
+            for m in &mut state.marked { *m = false; }
+        }
+        // Select all — sélectionne toutes les slices (vert) en effaçant les
+        // suppressions au passage (mutuellement exclusif).
+        if ui.add_enabled_ui(has_audio && selected < total, |ui| {
+            ui.add_sized([90.0, BTN_H], egui::Button::new("Select all"))
+        }).inner.clicked() {
+            for s in &mut state.selected { *s = true; }
+            for m in &mut state.marked { *m = false; }
+        }
+
+        // Action primaire + MIDI export à droite.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Send to Upload — primaire (verte) flush right. Le compteur
+            // affiche le nombre exact de slices qui seront exportées selon
+            // la sémantique filter/trash.
             let send_btn = egui::Button::new(
-                egui::RichText::new(format!("Send to Upload ({unmarked})"))
+                egui::RichText::new(format!("Send to Upload ({export_count})"))
                     .color(egui::Color32::WHITE),
             ).fill(palette::ACCENT_GREEN);
-            if ui.add_enabled_ui(has_audio && has_slices && unmarked > 0, |ui| {
+            if ui.add_enabled_ui(has_audio && has_slices && export_count > 0, |ui| {
                 ui.add_sized([170.0, BTN_H], send_btn)
             }).inner.clicked() {
                 state.request_send_to_upload = true;
@@ -1058,45 +1137,34 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
             ui.separator();
             ui.add_space(8.0);
 
-            // Reset (recharge fichier source) — secondary
-            if ui.add_enabled_ui(has_audio, |ui| {
-                ui.add_sized([100.0, BTN_H], egui::Button::new("Reset"))
-            }).inner.clicked() {
-                state.reset();
+            // Drag MIDI (custom Sense::drag — régénère TOUJOURS le fichier
+            // au début du drag pour refléter la valeur actuelle de Beats /
+            // les déplacements d'onsets).
+            #[cfg(windows)]
+            {
+                let drag_resp = drag_midi_button(ui, midi_enabled, BTN_H);
+                if drag_resp.drag_started() {
+                    match state.generate_midi_file() {
+                        Ok(p) => match crate::ole_drag::drag_file(&p) {
+                            Ok(eff) if eff.0 != 0 => {
+                                state.error = Some(format!(
+                                    "MIDI déposé dans le DAW ({})", p.display(),
+                                ));
+                            }
+                            Ok(_) => state.error = Some("Drag annulé".into()),
+                            Err(e) => state.error = Some(format!("× drag : {e}")),
+                        },
+                        Err(e) => state.error = Some(format!("× {e}")),
+                    }
+                }
             }
-            ui.add_space(8.0);
-            // Delete marked — action destructive, accent rouge
-            let delete_btn = egui::Button::new(
-                egui::RichText::new(format!("Delete {marked}")).color(egui::Color32::WHITE),
-            ).fill(palette::ACCENT_RED);
-            if ui.add_enabled_ui(has_audio && marked > 0 && marked < total, |ui| {
-                ui.add_sized([110.0, BTN_H], delete_btn)
-            }).inner.clicked() {
-                state.delete_marked();
-            }
-            ui.add_space(8.0);
-            // None → décoche tout
-            if ui.add_enabled_ui(has_audio && marked > 0, |ui| {
-                ui.add_sized([80.0, BTN_H], egui::Button::new("None"))
-            }).inner.clicked() {
-                for m in &mut state.marked { *m = false; }
-            }
-            // Select all
-            if ui.add_enabled_ui(has_audio && marked < total, |ui| {
-                ui.add_sized([90.0, BTN_H], egui::Button::new("Select all"))
-            }).inner.clicked() {
-                for m in &mut state.marked { *m = true; }
-            }
+            ui.add_space(4.0);
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Génération MIDI : bouton + spinbox N beats juste à gauche.
+            // Save MIDI (couleur cuivre/ambre BUTTON_MIDI plus douce que
+            // l'ancien ACCENT_YELLOW agressif).
             let midi_btn = egui::Button::new(
                 egui::RichText::new("Save MIDI").color(egui::Color32::WHITE),
-            ).fill(palette::ACCENT_YELLOW);
-            let midi_enabled = has_audio && !state.onsets.is_empty();
+            ).fill(palette::BUTTON_MIDI);
             if ui.add_enabled_ui(midi_enabled, |ui| {
                 ui.add_sized([110.0, BTN_H], midi_btn)
             }).inner.clicked() {
@@ -1107,35 +1175,8 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
             }
             ui.add_space(4.0);
 
-            // Bouton Drag MIDI : press+drag déclenche un OLE drag-drop vers
-            // l'app sous le curseur (typiquement un DAW). Régénère le fichier
-            // si besoin pour qu'il soit toujours à jour.
-            #[cfg(windows)]
-            {
-                let drag_resp = drag_midi_button(ui, midi_enabled, BTN_H);
-                if drag_resp.drag_started() {
-                    let path_res = match &state.last_midi_path {
-                        Some(p) if p.exists() => Ok(p.clone()),
-                        _ => state.generate_midi_file(),
-                    };
-                    match path_res {
-                        Ok(p) => {
-                            match crate::ole_drag::drag_file(&p) {
-                                Ok(eff) if eff.0 != 0 => {
-                                    state.error = Some(format!(
-                                        "MIDI déposé dans le DAW ({})", p.display(),
-                                    ));
-                                }
-                                Ok(_) => state.error = Some("Drag annulé".into()),
-                                Err(e) => state.error = Some(format!("× drag : {e}")),
-                            }
-                        }
-                        Err(e) => state.error = Some(format!("× {e}")),
-                    }
-                }
-            }
-
-            ui.add_space(4.0);
+            // Spinbox Beats — placé juste à gauche des boutons MIDI pour le
+            // contexte (il sert UNIQUEMENT à la génération MIDI).
             ui.add_enabled_ui(has_audio, |ui| {
                 ui.add(egui::DragValue::new(&mut state.n_beats).range(1..=64));
             });
@@ -1161,7 +1202,7 @@ fn drag_midi_button(ui: &mut egui::Ui, enabled: bool, h: f32) -> egui::Response 
     } else if resp.hovered() {
         palette::BG_HOVER
     } else {
-        palette::ACCENT_YELLOW
+        palette::BUTTON_MIDI
     };
     ui.painter().rect(rect, 4.0, fill, visuals.bg_stroke);
     let text_color = if enabled { egui::Color32::WHITE } else { palette::FG_DIM };

@@ -31,6 +31,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Cmd {
+    /// Sondage SMDI : Master Identify → vérifie qu'un sampler répond.
+    /// Utilisé juste après la connexion worker pour valider que le hardware
+    /// est présent à l'adresse configurée.
+    Probe {
+        #[serde(default = "default_ha")] ha: u32,
+        #[serde(default)] bus: u8,
+        #[serde(default)] target: u8,
+        #[serde(default)] lun: u8,
+    },
     FindFreeSlot {
         #[serde(default = "default_ha")] ha: u32,
         #[serde(default)] bus: u8,
@@ -70,6 +79,8 @@ pub enum Cmd {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     Ready,
+    /// Réponse à `Cmd::Probe` : le sampler a renvoyé un Slave Identify valide.
+    ProbeOk,
     FreeSlot { slot: u32 },
     ScanProgress { scanned: u32, found: u32 },
     SamplesList { samples: Vec<SampleInfo> },

@@ -39,6 +39,11 @@ tracing-subscriber.workspace = true
 # Tempfiles pour MIDI drag-out
 tempfile.workspace = true
 
+# Archives (drag-IN .zip / .tar.gz dans Upload)
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true

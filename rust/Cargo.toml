@@ -80,6 +80,11 @@ windows = { version = "0.58", features = [
 # Tests
 tempfile = "3"
 
+# Archives (drag-IN .zip / .tar.gz pour ajouter en bloc des WAV en Upload)
+zip = "0.6"
+flate2 = "1"
+tar = "0.4"
+
 # Profile release : optimisé pour la taille finale + perf au démarrage.
 # - lto=true     : link-time optimization (réduit la taille + inline cross-crate)
 # - codegen-units=1 : meilleure opt globale (build plus lent, ok en CI)

@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use a3000_core::wav::peek_wave_metadata;
+use a3000_core::wav::{load_wave, peek_wave_metadata};
 
+use crate::audio::{pcm16_le_to_mono_f32, Playback};
 use crate::config::Config;
 use crate::theme::palette;
 
@@ -37,6 +38,11 @@ pub struct UploadState {
     pub pending_find_slot: bool,
     /// Prochain slot à attribuer (auto-incrémenté entre items).
     pub next_slot: u32,
+    /// Audio playback en cours (preview d'un item de la queue, oneshot).
+    /// `cpal::Stream` est `!Send` sur Windows → vit sur le thread GUI.
+    playback: Option<Playback>,
+    /// Index de l'item en cours de preview (None si rien en lecture).
+    playing_idx: Option<usize>,
 }
 
 pub struct UploadItem {
@@ -170,29 +176,113 @@ impl UploadState {
                 && it.error_msg.is_none()
         })
     }
+
+    /// Toggle le preview audio d'un item : si déjà en lecture sur cet item,
+    /// stop ; sinon stop l'éventuel preview en cours et joue celui-ci.
+    pub fn toggle_play(&mut self, idx: usize) {
+        if self.playing_idx == Some(idx) {
+            self.playback = None;
+            self.playing_idx = None;
+            return;
+        }
+        let Some(item) = self.items.get(idx) else { return; };
+        if item.state == UploadItemState::Error || item.error_msg.is_some() {
+            return;
+        }
+        // Charge le WAV via a3000_core::wav::load_wave (PCM 16-bit LE) puis
+        // convertit en mono f32 via le helper partagé.
+        match load_wave(&item.path) {
+            Ok(payload) => {
+                let mono = pcm16_le_to_mono_f32(&payload);
+                let sr = payload.sample_rate;
+                self.playback = None;
+                match Playback::start_oneshot(mono, sr) {
+                    Ok(p) => {
+                        self.playback = Some(p);
+                        self.playing_idx = Some(idx);
+                    }
+                    Err(e) => eprintln!("upload play: {e}"),
+                }
+            }
+            Err(e) => eprintln!("upload play load_wave: {e}"),
+        }
+    }
+
+    /// Détecte la fin du oneshot et nettoie. À appeler avant le rendu.
+    pub fn poll_play_end(&mut self) {
+        if let Some(pb) = &self.playback {
+            if pb.position_fraction() >= 1.0 - 1e-3 {
+                self.playback = None;
+                self.playing_idx = None;
+            }
+        }
+    }
+
+    pub fn is_playing(&self) -> bool { self.playing_idx.is_some() }
 }
 
 /// Drain les fichiers droppés sur la fenêtre depuis la frame courante et
-/// retourne la liste de WAV à ajouter. Fichiers non-WAV ignorés silencieusement.
-fn drain_dropped_wavs(ctx: &egui::Context) -> Vec<PathBuf> {
+/// retourne (paths_wav, errors_archives). Les WAV directs sont passés tels
+/// quels ; les archives .zip/.tar.gz/.tgz/.tar sont extraites dans %TEMP%
+/// et leurs WAV ajoutés à la liste. Les autres extensions sont ignorées.
+fn drain_dropped_wavs(ctx: &egui::Context) -> (Vec<PathBuf>, Vec<String>) {
     let raw_files = ctx.input(|i| i.raw.dropped_files.clone());
-    raw_files.into_iter()
-        .filter_map(|f| f.path)
-        .filter(|p| matches!(
-            p.extension().and_then(|e| e.to_str()),
-            Some("wav") | Some("WAV")
-        ))
-        .collect()
+    let mut wavs = Vec::new();
+    let mut errors = Vec::new();
+    for f in raw_files {
+        let Some(p) = f.path else { continue; };
+        // .wav direct ?
+        if matches!(p.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(), Some("wav")) {
+            wavs.push(p);
+            continue;
+        }
+        // Archive ?
+        if let Some(result) = crate::archive::try_extract_archive(&p) {
+            match result {
+                Ok(extracted) => {
+                    if extracted.is_empty() {
+                        errors.push(format!(
+                            "{} : aucun .wav dans l'archive",
+                            p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        ));
+                    } else {
+                        wavs.extend(extracted);
+                    }
+                }
+                Err(e) => errors.push(format!(
+                    "{} : {e}",
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                )),
+            }
+        }
+        // Autre extension : ignoré silencieusement.
+    }
+    (wavs, errors)
 }
 
 /// Réservation pour le footer (séparateur + ligne boutons + spacing).
 const FOOTER_RESERVED_H: f32 = 70.0;
 
 pub fn show(ui: &mut egui::Ui, state: &mut UploadState, config: &Config) {
-    // Drop : on ajoute les fichiers WAV droppés.
-    let dropped = drain_dropped_wavs(ui.ctx());
+    // Drop : on ajoute les fichiers WAV droppés (incluant les .wav extraits
+    // d'éventuels .zip / .tar.gz droppés).
+    let (dropped, archive_errors) = drain_dropped_wavs(ui.ctx());
     for p in dropped {
         state.add_path(p);
+    }
+
+    // Détecte la fin du oneshot de preview audio + repaint pendant la lecture
+    // pour mettre à jour le bouton P/S et la surbrillance.
+    state.poll_play_end();
+    if state.is_playing() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+    }
+    for e in archive_errors {
+        // Archive en erreur → on l'affiche comme un item Error pour info.
+        let placeholder = std::path::PathBuf::from(format!("[archive] {e}"));
+        let mut item = UploadItem::from_path(placeholder);
+        item.error_msg = Some(e);
+        state.items.push(item);
     }
 
     ui.add_space(6.0);
@@ -264,6 +354,7 @@ const COL_DUR: f32 = 70.0;
 const COL_SLOT: f32 = 60.0;
 const COL_STATE: f32 = 80.0;
 const COL_PROGRESS: f32 = 140.0;
+const COL_PLAY: f32 = 30.0;
 const COL_ACTION: f32 = 28.0;
 
 /// Cellule de largeur **strictement fixe** (W × ROW_H) : `allocate_exact_size`
@@ -315,6 +406,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
             });
             header_label(ui, "File", COL_FILE);
             header_label(ui, "Sample name", COL_NAME);
+            header_label(ui, "", COL_PLAY); // colonne play juste à droite du sample name
             header_label(ui, "Format", COL_FORMAT);
             header_label(ui, "Size", COL_SIZE);
             header_label(ui, "Dur", COL_DUR);
@@ -325,13 +417,20 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
         });
         ui.separator();
 
+        // Capture playing_idx avant l'iter mutable (split borrow).
+        let playing_idx = state.playing_idx;
         let mut to_remove: Option<usize> = None;
+        let mut to_play: Option<usize> = None;
         for (idx, item) in state.items.iter_mut().enumerate() {
-            let row_color = match item.state {
-                UploadItemState::Done => palette::ACCENT_GREEN,
-                UploadItemState::Running => palette::ACCENT_YELLOW,
-                UploadItemState::Error => palette::ACCENT_RED,
-                UploadItemState::Pending => palette::FG_TEXT,
+            let row_color = if playing_idx == Some(idx) {
+                palette::ACCENT_YELLOW  // surbrillance preview
+            } else {
+                match item.state {
+                    UploadItemState::Done => palette::ACCENT_GREEN,
+                    UploadItemState::Running => palette::ACCENT_YELLOW,
+                    UploadItemState::Error => palette::ACCENT_RED,
+                    UploadItemState::Pending => palette::FG_TEXT,
+                }
             };
             ui.horizontal(|ui| {
                 cell(ui, COL_CHECK, |ui| {
@@ -355,6 +454,20 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                     );
                     if resp.changed() && item.sample_name.chars().count() > 16 {
                         item.sample_name = item.sample_name.chars().take(16).collect();
+                    }
+                });
+
+                // Bouton Play/Stop : icônes peintes comme shapes (triangle
+                // play / carré stop) au lieu de glyphs Unicode pour garantir
+                // un centrage pixel-perfect (les glyphs ▶ ■ ont des galleys
+                // asymétriques qui décalent visuellement le centrage egui).
+                cell(ui, COL_PLAY, |ui| {
+                    let is_playing_this = playing_idx == Some(idx);
+                    let tip = if is_playing_this { "Stop preview" } else { "Play preview" };
+                    if icon_button_play(ui, 24.0, ROW_H - 6.0, is_playing_this)
+                        .on_hover_text(tip).clicked()
+                    {
+                        to_play = Some(idx);
                     }
                 });
 
@@ -400,6 +513,9 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
         if let Some(i) = to_remove {
             state.items.remove(i);
         }
+        if let Some(i) = to_play {
+            state.toggle_play(i);
+        }
     });
 }
 
@@ -407,6 +523,40 @@ fn header_label(ui: &mut egui::Ui, text: &str, width: f32) {
     cell(ui, width, |ui| {
         ui.label(egui::RichText::new(text).color(palette::FG_DIM).strong());
     });
+}
+
+/// Bouton à icône peinte (triangle play / carré stop) — centrage pixel-perfect
+/// indépendant des galleys asymétriques des glyphs Unicode.
+fn icon_button_play(ui: &mut egui::Ui, w: f32, h: f32, is_playing: bool) -> egui::Response {
+    let size = egui::vec2(w, h);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&resp);
+    // Fond + bordure du bouton (style egui standard).
+    ui.painter().rect(
+        rect,
+        visuals.rounding,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+    );
+    // Icône peinte centrée. Padding interne 25 % pour respirer.
+    let pad = egui::vec2(rect.width() * 0.25, rect.height() * 0.25);
+    let inner = egui::Rect::from_min_max(rect.min + pad, rect.max - pad);
+    let color = visuals.text_color();
+    if is_playing {
+        // Carré (stop icon).
+        ui.painter().rect_filled(inner, 1.0, color);
+    } else {
+        // Triangle plein pointant à droite (play icon).
+        let pts = vec![
+            inner.left_top(),
+            inner.left_bottom(),
+            egui::pos2(inner.right(), inner.center().y),
+        ];
+        ui.painter().add(egui::Shape::convex_polygon(
+            pts, color, egui::Stroke::NONE,
+        ));
+    }
+    resp
 }
 
 fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
