@@ -32,7 +32,7 @@
 **🎉 PORT RUST COMPLET — 5 phases terminées.** Binaire 5.8 MB (vs 311 MB Python).
 Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python portés et validés.
 
-- [ ] **REPRENDRE ICI** Bug UI tab Upload/Download/Slicer : avec beaucoup d'items, les rows de la liste se **superposent visuellement** au header et au footer (header et footer sont visibles à leur place, mais les rows passent par-dessus). Tentatives infructueuses : (1) `ScrollArea::max_height(available)` ; (2) `TopBottomPanel::bottom` rendered avant/après le content ; (3) `ui.allocate_ui(strict_size)` ; (4) `allocate_exact_size + child_ui + set_clip_rect`. Pistes pour demain : investiguer `egui_extras::TableBuilder` (purpose-built pour ce cas) ; vérifier si `set_clip_rect` se propage vraiment au painter de la ScrollArea ; tester `egui::Frame::group` ou `egui::Frame::none().fill().stroke().show()` qui force un nouveau coordinate space.
+- [x] Bug UI overlap rows / header / footer : la helper `cell()` faisait `child.set_clip_rect(rect)` qui REMPLACE le clip parent au lieu d'INTERSECTER. Pour les rows hors-viewport ScrollArea, le clip viewport hérité était écrasé → la cellule pouvait peindre partout dans son rect propre, y compris par-dessus header/footer. Fix : `child.set_clip_rect(rect.intersect(ui.clip_rect()))`. (Diagnostic : `examples/scroll_repro.rs` montrait que les patterns externes — TopBottomPanel, allocate_ui, child_ui — fonctionnaient en isolation, donc le bug était au niveau plus bas.)
 
 ## Moyen terme (Sprint)
 

@@ -270,6 +270,11 @@ const COL_ACTION: f32 = 28.0;
 /// réserve un rect immuable au parent, on construit un child_ui bordé par ce
 /// rect avec clipping + wrap=Truncate. Les labels trop longs sont tronqués
 /// au lieu de pousser le layout.
+///
+/// IMPORTANT : `set_clip_rect` REMPLACE le clip parent au lieu de l'intersecter.
+/// On intersecte manuellement avec `ui.clip_rect()` pour conserver le clip
+/// hérité (ex : viewport d'une ScrollArea parente) — sinon les rows hors-viewport
+/// dessinent par-dessus header/footer.
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(w, ROW_H),
@@ -277,7 +282,7 @@ fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R
     );
     let layout = egui::Layout::left_to_right(egui::Align::Center);
     let mut child = ui.child_ui(rect, layout, None);
-    child.set_clip_rect(rect);
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     add(&mut child)
 }

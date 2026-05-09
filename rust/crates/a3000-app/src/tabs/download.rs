@@ -137,13 +137,15 @@ const COL_DUR: f32 = 70.0;
 const COL_PROGRESS: f32 = 140.0;
 
 fn cell<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // Cf. upload.rs : intersection manuelle avec ui.clip_rect() pour respecter
+    // le clip hérité (ScrollArea viewport).
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(w, ROW_H),
         egui::Sense::hover(),
     );
     let layout = egui::Layout::left_to_right(egui::Align::Center);
     let mut child = ui.child_ui(rect, layout, None);
-    child.set_clip_rect(rect);
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
     add(&mut child)
 }
