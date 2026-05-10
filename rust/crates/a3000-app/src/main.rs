@@ -52,11 +52,20 @@ fn main() -> ExitCode {
     }
 
     // Mode GUI (defaut).
+    // Icône runtime (title bar + barre des tâches) via eframe — distincte
+    // de l'icône .ico embarquée par winres dans le .exe (qui sert pour
+    // Explorer + propriétés du fichier).
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .ok();
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1100.0, 720.0])
+        .with_min_inner_size([700.0, 480.0])
+        .with_title("A3000 Transfer");
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([700.0, 480.0])
-            .with_title("A3000 Transfer"),
+        viewport,
         ..Default::default()
     };
     match eframe::run_native(
