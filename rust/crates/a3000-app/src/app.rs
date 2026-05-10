@@ -288,6 +288,13 @@ impl A3000App {
     /// les coups suivants démarrent l'item Pending suivant.
     #[cfg(windows)]
     fn try_start_next_upload(&mut self) {
+        // Stop batch demandé : l'item en cours est déjà terminé (on est
+        // appelés depuis on_event après Done/Error), on n'enchaîne pas.
+        if self.upload.stop_requested {
+            self.upload.stop_requested = false;
+            self.status = "Batch upload arrêté.".into();
+            return;
+        }
         let WorkerState::Connected(handle) = &self.worker else { return; };
         let sender = handle.sender();
         let Some(idx) = self.upload.next_pending() else {
@@ -416,6 +423,15 @@ impl A3000App {
     /// Lance le download du prochain sample coché. Return None si batch vide.
     #[cfg(windows)]
     fn try_start_next_download(&mut self) {
+        // Stop batch demandé : l'item en cours est déjà fini (Received), on
+        // n'enchaîne pas sur le suivant.
+        if self.download.stop_requested {
+            self.download.stop_requested = false;
+            self.download.current_idx = None;
+            self.download.download_progress = 0.0;
+            self.status = "Batch download arrêté.".into();
+            return;
+        }
         let WorkerState::Connected(handle) = &self.worker else { return; };
         let sender = handle.sender();
         // Trouve le 1er sample coché qui n'a pas été tagué Done dans cette

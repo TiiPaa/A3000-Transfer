@@ -32,6 +32,11 @@ pub struct UploadState {
     /// Demande de démarrage de batch (set par le bouton Upload, lue par l'App
     /// qui kick off le transfert et reset le flag).
     pub request_upload: bool,
+    /// Demande d'arrêt entre 2 items : l'item courant termine normalement, mais
+    /// la batch n'enchaîne pas sur le suivant. Set par le bouton Stop, reset
+    /// quand le batch se termine. Pas de cancel mid-transfert (cf. analyse :
+    /// risque de slot stuck sur le sampler + UAC re-prompt à chaque cancel).
+    pub stop_requested: bool,
     /// Index de l'item en cours de transfert (Some pendant Running).
     pub current_idx: Option<usize>,
     /// True quand on attend Event::FreeSlot après avoir envoyé FindFreeSlot.
@@ -490,8 +495,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                     ui.label(egui::RichText::new(txt).color(col));
                 });
                 cell(ui, COL_PROGRESS, |ui| {
-                    ui.add(egui::ProgressBar::new(item.progress)
-                        .desired_width(COL_PROGRESS - 10.0).show_percentage());
+                    paint_progress_bar(ui, item.progress, COL_PROGRESS - 10.0, 14.0);
                 });
                 cell(ui, COL_ACTION, |ui| {
                     if ui.small_button("×").on_hover_text("Remove").clicked() {
@@ -523,6 +527,39 @@ fn header_label(ui: &mut egui::Ui, text: &str, width: f32) {
     cell(ui, width, |ui| {
         ui.label(egui::RichText::new(text).color(palette::FG_DIM).strong());
     });
+}
+
+/// Progress bar peinte manuellement : rect strict (pas d'auto-resize comme
+/// `egui::ProgressBar` qui étend la largeur pour faire rentrer le texte
+/// `X%` et déborde la cellule). Texte centré horizontalement dans le rect
+/// quel que soit le progrès.
+pub(super) fn paint_progress_bar(ui: &mut egui::Ui, progress: f32, w: f32, h: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let painter = ui.painter();
+    // Fond de la barre
+    painter.rect_filled(rect, 3.0, palette::BG_DEEP);
+    // Remplissage progressif
+    let progress = progress.clamp(0.0, 1.0);
+    if progress > 0.0 {
+        let fill_w = (rect.width() * progress).max(2.0);
+        let fill_rect = egui::Rect::from_min_size(
+            rect.min,
+            egui::vec2(fill_w, rect.height()),
+        );
+        painter.rect_filled(fill_rect, 3.0, palette::ACCENT_GREEN);
+    }
+    // Texte X% centré dans le rect global, jamais hors bornes (afficher
+    // depuis 1% pour éviter "0%" sur barre vide).
+    if progress > 0.005 {
+        let pct = (progress * 100.0).round() as i32;
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("{pct}%"),
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 /// Bouton à icône peinte (triangle play / carré stop) — centrage pixel-perfect
@@ -584,17 +621,31 @@ fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
         const BTN_H: f32 = 32.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = state.current_idx.is_some() || state.pending_find_slot;
-            let upload_enabled = checked > 0 && !busy;
-            let label = if busy { "Uploading…".to_string() } else { format!("Upload {}", checked) };
-            let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
+            // Bouton Upload (devient Stop pendant un batch). Quand busy,
+            // click → set stop_requested : la batch s'arrête après l'item
+            // en cours (cf. design : pas de cancel mid-transfert).
+            let (label, fill, enabled) = if busy {
+                let txt = if state.stop_requested {
+                    "Stopping…".to_string()
+                } else {
+                    "Stop".to_string()
+                };
+                (txt, palette::ACCENT_RED, !state.stop_requested)
+            } else {
+                (format!("Upload {}", checked), palette::ACCENT_GREEN, checked > 0)
+            };
             let upload_btn = egui::Button::new(
                 egui::RichText::new(label).color(egui::Color32::WHITE),
             ).fill(fill);
-            let resp = ui.add_enabled_ui(upload_enabled, |ui| {
+            let resp = ui.add_enabled_ui(enabled, |ui| {
                 ui.add_sized([120.0, BTN_H], upload_btn)
             }).inner;
             if resp.clicked() {
-                state.request_upload = true;
+                if busy {
+                    state.stop_requested = true;
+                } else {
+                    state.request_upload = true;
+                }
             }
             ui.add_space(8.0);
             if ui.add_sized([0.0, BTN_H], egui::Button::new("Reset state")).clicked() {

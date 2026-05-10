@@ -33,6 +33,9 @@ pub struct DownloadState {
     pub request_download: bool,
     /// Progression du download courant.
     pub download_progress: f32,
+    /// Demande d'arrêt entre 2 items : l'item courant termine normalement,
+    /// mais la batch n'enchaîne pas sur le suivant.
+    pub stop_requested: bool,
 }
 
 /// Réservation pour le footer (cf. upload.rs).
@@ -110,18 +113,28 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = state.current_idx.is_some();
-            let dl_enabled = !busy && n_checked > 0;
-            let label = if busy { "Downloading…".to_string() }
-                        else { format!("Download {}", n_checked) };
-            let fill = if busy { palette::ACCENT_YELLOW } else { palette::ACCENT_GREEN };
+            // Bouton Download → Stop quand un batch tourne (stop_batch
+            // semantics : l'item en cours finit, pas d'enchaînement sur les
+            // suivants). Cf. upload.rs : pas de cancel mid-transfert.
+            let (label, fill, enabled) = if busy {
+                let txt = if state.stop_requested { "Stopping…".to_string() }
+                          else { "Stop".to_string() };
+                (txt, palette::ACCENT_RED, !state.stop_requested)
+            } else {
+                (format!("Download {}", n_checked), palette::ACCENT_GREEN, n_checked > 0)
+            };
             let btn = egui::Button::new(
                 egui::RichText::new(label).color(egui::Color32::WHITE),
             ).fill(fill);
-            let resp = ui.add_enabled_ui(dl_enabled, |ui| {
+            let resp = ui.add_enabled_ui(enabled, |ui| {
                 ui.add_sized([140.0, 32.0], btn)
             }).inner;
             if resp.clicked() {
-                state.request_download = true;
+                if busy {
+                    state.stop_requested = true;
+                } else {
+                    state.request_download = true;
+                }
             }
         });
     });
@@ -206,8 +219,9 @@ fn show_table(ui: &mut egui::Ui, state: &mut DownloadState) {
                 cell(ui, COL_DUR, |ui| { ui.label(format!("{:.2}s", s.duration)); });
                 cell(ui, COL_PROGRESS, |ui| {
                     if is_current {
-                        ui.add(egui::ProgressBar::new(current_progress)
-                            .desired_width(COL_PROGRESS - 10.0).show_percentage());
+                        super::upload::paint_progress_bar(
+                            ui, current_progress, COL_PROGRESS - 10.0, 14.0,
+                        );
                     }
                 });
             });
