@@ -334,7 +334,7 @@ impl A3000App {
         }
         // Doit être connecté.
         if !matches!(self.worker, WorkerState::Connected(_)) {
-            self.status = "Worker non connecté — clique Connect…".into();
+            self.status = "× Worker non connecté — clique Connect…".into();
             self.upload.request_upload = false;
             return;
         }
@@ -396,14 +396,14 @@ impl A3000App {
                     self.status = "Scan en cours…".into();
                 }
             } else {
-                self.status = "Worker non connecté — clique Connect…".into();
+                self.status = "× Worker non connecté — clique Connect…".into();
             }
         }
 
         if self.download.request_download {
             self.download.request_download = false;
             if !matches!(self.worker, WorkerState::Connected(_)) {
-                self.status = "Worker non connecté — clique Connect…".into();
+                self.status = "× Worker non connecté — clique Connect…".into();
                 return;
             }
             self.try_start_next_download();
@@ -663,10 +663,23 @@ impl eframe::App for A3000App {
             self.show_settings(ctx);
         }
 
-        // Bottom status bar
+        // Bottom status bar — coloration sémantique selon le préfixe :
+        //   ×        → rouge (erreur)
+        //   ! / ⚠   → orange (warning)
+        //   ✓        → vert (succès)
+        //   sinon    → gris dim (info)
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&self.status).color(palette::FG_DIM));
+                let (color, strong) = if self.status.starts_with('×') {
+                    (palette::ACCENT_RED, true)
+                } else if self.status.starts_with('!') {
+                    (palette::ACCENT_ORANGE, true)
+                } else {
+                    (palette::FG_DIM, false)
+                };
+                let mut text = egui::RichText::new(&self.status).color(color);
+                if strong { text = text.strong(); }
+                ui.label(text);
             });
         });
 
