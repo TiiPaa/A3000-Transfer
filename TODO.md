@@ -41,6 +41,8 @@ Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python por
 - [x] Upload : import drag-IN d'archives `.zip` / `.tar.gz` / `.tgz` / `.tar` (module `archive.rs` + crates `zip`, `flate2`, `tar`) — extraction dans `%TEMP%\a3000_extracted\<stem>_<pid>_<nano>\`, walk récursif, ajout des `.wav` à la queue
 - [x] Module `audio.rs` partagé Slicer ↔ Upload (`Playback::start_loop` / `start_oneshot` + `pcm16_le_to_mono_f32`)
 - [x] Upload : preview audio par item — bouton play/stop par row (icône peinte triangle/carré pour centrage pixel-perfect, glyphs Unicode `▶`/`■` ont des galleys asymétriques) à droite du Sample name ; row highlight jaune pendant la lecture ; oneshot, stop auto à la fin
+- [x] Upload : preview audio via click sur le nom du fichier (curseur PointingHand + tooltip Play/Stop) ; colonne Play séparée supprimée
+- [x] Fix UI : checkbox tronquée à gauche dans tables Upload/Download — le focus stroke / hover ring d'egui dépasse de ~2 px le box visible et était rogné par le `clip_rect` strict du cell. Fix : `CHECKBOX_LEFT_PAD = 6.0` + `ui.add_space(CHECKBOX_LEFT_PAD)` au début de chaque cell checkbox (header + rows)
 
 ## Moyen terme (Sprint)
 

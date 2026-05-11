@@ -350,7 +350,13 @@ fn empty_drop_zone(ui: &mut egui::Ui) {
 // Largeurs de colonnes (px) — partagées header + rows pour alignement strict.
 // Hauteur de ligne ≥ interact_size (24) + 4 px de respiration verticale.
 const ROW_H: f32 = 28.0;
-const COL_CHECK: f32 = 28.0;
+// 36 px : 6 px add_space gauche (cf. cell — empêche le clip du focus stroke
+// d'egui qui dépasse de ~2 px le bord visible du box) + 16 px box + marge.
+const COL_CHECK: f32 = 36.0;
+/// Décalage à gauche de la checkbox dans son cell : sans ça le focus
+/// stroke / hover ring d'egui (qui dépasse de ~2 px le box) est tronqué par
+/// le clip_rect strict du cell.
+const CHECKBOX_LEFT_PAD: f32 = 6.0;
 const COL_FILE: f32 = 200.0;
 const COL_NAME: f32 = 140.0;
 const COL_FORMAT: f32 = 150.0;
@@ -359,8 +365,7 @@ const COL_DUR: f32 = 70.0;
 const COL_SLOT: f32 = 60.0;
 const COL_STATE: f32 = 80.0;
 const COL_PROGRESS: f32 = 140.0;
-const COL_PLAY: f32 = 30.0;
-const COL_ACTION: f32 = 28.0;
+const COL_ACTION: f32 = 40.0;
 
 /// Cellule de largeur **strictement fixe** (W × ROW_H) : `allocate_exact_size`
 /// réserve un rect immuable au parent, on construit un child_ui bordé par ce
@@ -395,6 +400,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
         ui.horizontal(|ui| {
             // Check-all
             cell(ui, COL_CHECK, |ui| {
+                ui.add_space(CHECKBOX_LEFT_PAD);
                 let any_checked = state.items.iter().any(|it| it.checked);
                 let all_checked = !state.items.is_empty()
                     && state.items.iter().filter(|it| it.state != UploadItemState::Error)
@@ -411,7 +417,6 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
             });
             header_label(ui, "File", COL_FILE);
             header_label(ui, "Sample name", COL_NAME);
-            header_label(ui, "", COL_PLAY); // colonne play juste à droite du sample name
             header_label(ui, "Format", COL_FORMAT);
             header_label(ui, "Size", COL_SIZE);
             header_label(ui, "Dur", COL_DUR);
@@ -439,6 +444,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
             };
             ui.horizontal(|ui| {
                 cell(ui, COL_CHECK, |ui| {
+                    ui.add_space(CHECKBOX_LEFT_PAD);
                     ui.add_enabled(
                         item.state != UploadItemState::Error,
                         egui::Checkbox::without_text(&mut item.checked),
@@ -447,8 +453,22 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
 
                 let file_name = item.path.file_name()
                     .and_then(|s| s.to_str()).unwrap_or("?");
+                // Le file name est cliquable → toggle preview audio. Tooltip
+                // hover indique la sémantique + curseur PointingHand pour
+                // signaler que c'est interactif (convention web).
                 cell(ui, COL_FILE, |ui| {
-                    ui.label(egui::RichText::new(file_name).color(row_color));
+                    let is_playing_this = playing_idx == Some(idx);
+                    let tip = if is_playing_this { "Stop preview" } else { "Play preview" };
+                    let resp = ui.add(
+                        egui::Label::new(egui::RichText::new(file_name).color(row_color))
+                            .sense(egui::Sense::click()),
+                    ).on_hover_text(tip);
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        to_play = Some(idx);
+                    }
                 });
 
                 cell(ui, COL_NAME, |ui| {
@@ -459,20 +479,6 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                     );
                     if resp.changed() && item.sample_name.chars().count() > 16 {
                         item.sample_name = item.sample_name.chars().take(16).collect();
-                    }
-                });
-
-                // Bouton Play/Stop : icônes peintes comme shapes (triangle
-                // play / carré stop) au lieu de glyphs Unicode pour garantir
-                // un centrage pixel-perfect (les glyphs ▶ ■ ont des galleys
-                // asymétriques qui décalent visuellement le centrage egui).
-                cell(ui, COL_PLAY, |ui| {
-                    let is_playing_this = playing_idx == Some(idx);
-                    let tip = if is_playing_this { "Stop preview" } else { "Play preview" };
-                    if icon_button_play(ui, 24.0, ROW_H - 6.0, is_playing_this)
-                        .on_hover_text(tip).clicked()
-                    {
-                        to_play = Some(idx);
                     }
                 });
 
@@ -562,39 +568,6 @@ pub(super) fn paint_progress_bar(ui: &mut egui::Ui, progress: f32, w: f32, h: f3
     }
 }
 
-/// Bouton à icône peinte (triangle play / carré stop) — centrage pixel-perfect
-/// indépendant des galleys asymétriques des glyphs Unicode.
-fn icon_button_play(ui: &mut egui::Ui, w: f32, h: f32, is_playing: bool) -> egui::Response {
-    let size = egui::vec2(w, h);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let visuals = ui.style().interact(&resp);
-    // Fond + bordure du bouton (style egui standard).
-    ui.painter().rect(
-        rect,
-        visuals.rounding,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-    );
-    // Icône peinte centrée. Padding interne 25 % pour respirer.
-    let pad = egui::vec2(rect.width() * 0.25, rect.height() * 0.25);
-    let inner = egui::Rect::from_min_max(rect.min + pad, rect.max - pad);
-    let color = visuals.text_color();
-    if is_playing {
-        // Carré (stop icon).
-        ui.painter().rect_filled(inner, 1.0, color);
-    } else {
-        // Triangle plein pointant à droite (play icon).
-        let pts = vec![
-            inner.left_top(),
-            inner.left_bottom(),
-            egui::pos2(inner.right(), inner.center().y),
-        ];
-        ui.painter().add(egui::Shape::convex_polygon(
-            pts, color, egui::Stroke::NONE,
-        ));
-    }
-    resp
-}
 
 fn show_footer(ui: &mut egui::Ui, state: &mut UploadState) {
     let checked = state.checked_count();

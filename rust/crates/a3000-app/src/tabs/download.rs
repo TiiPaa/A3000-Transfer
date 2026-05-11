@@ -141,7 +141,10 @@ pub fn show(ui: &mut egui::Ui, state: &mut DownloadState) {
 }
 
 const ROW_H: f32 = 28.0;
-const COL_CHECK: f32 = 28.0;
+// 36 px : 6 px add_space gauche (cf. upload.rs — empêche le clip du focus
+// stroke d'egui qui dépasse de ~2 px le bord visible du box) + 16 px box + marge.
+const COL_CHECK: f32 = 36.0;
+const CHECKBOX_LEFT_PAD: f32 = 6.0;
 const COL_SLOT: f32 = 60.0;
 const COL_NAME: f32 = 220.0;
 const COL_FORMAT: f32 = 160.0;
@@ -172,6 +175,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut DownloadState) {
         // Header row
         ui.horizontal(|ui| {
             cell(ui, COL_CHECK, |ui| {
+                ui.add_space(CHECKBOX_LEFT_PAD);
                 let all_checked = state.checked.len() == state.samples.len()
                     && !state.samples.is_empty();
                 let mut header_check = all_checked;
@@ -200,6 +204,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut DownloadState) {
             let mut checked = state.checked.contains(&s.slot);
             ui.horizontal(|ui| {
                 cell(ui, COL_CHECK, |ui| {
+                    ui.add_space(CHECKBOX_LEFT_PAD);
                     if ui.add(egui::Checkbox::without_text(&mut checked)).changed() {
                         if checked { state.checked.insert(s.slot); }
                         else { state.checked.remove(&s.slot); }
