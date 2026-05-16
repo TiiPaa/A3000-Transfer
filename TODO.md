@@ -47,6 +47,10 @@ Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python por
 - [x] Preview audio stéréo : `Playback` accepte maintenant un buffer interleaved f32 + `src_channels` ; routage mono→repli sur tous les canaux device / stéréo + device ≥2ch → L=ch0 R=ch1 / stéréo + device mono → downmix (L+R)/2. Slicer Loop, preview slice et Upload preview passent par `pcm16_le_to_interleaved_f32` / `pcm16_le_bytes_to_interleaved_f32`
 - [x] Slicer : click droit sur la waveform → près d'un onset (< 5 px) = supprime la séparation (slice idx-1 absorbe idx) / ailleurs = ajoute une séparation à la position du clic (split la slice). Mirror Python view.py:407-415. L'onset 0 (début audio) ne peut pas être supprimé. Indices `dragging_onset` / `current_onset` / `previewing_slice` décalés pour rester valides
 - [x] Slicer : slider Sensitivity (0.2 → 3.0, défaut 1.0) sur ligne 1 du footer (à droite des compteurs). Re-détection en temps réel pendant le drag (`resp.changed()`) ; wipe les sélections/marquages utilisateur car indices invalidés. Mirror Python view.py:209-212
+- [x] Slicer Remix : pipeline 3 étages (Shuffle → Repeat → Stutter) avec intensités indépendantes (sliders Sh/Rp/St). Sequence rendue en strip colorée sous la waveform (HSV par slice_idx, angle d'or). Régénération temps réel sur changement, déterministe via `remix_seed` (ChaCha8). Auto-restart de la lecture si Play actif. Sync remix après modifs onsets (delete_marked / redetect / add_onset / delete_onset).
+- [x] Slicer Remix : 4 modes de Shuffle (Random / Beat-aligned via `n_beats` / Pair-swap / Block-reorder taille 2 ou 4 selon intensity) sélectionnables via ComboBox.
+- [x] Slicer Remix : preview audio en boucle via `Playback::start_loop` sur le buffer rendu (interleaved f32, préserve la stéréo) + playhead orange sur la strip. Bouton Play/Stop dédié (vert/orange).
+- [x] Slicer Remix : drag-out MIDI via OLE (`generate_midi_sequence` ajouté dans `a3000-core::midi` — note = `C2 + slice_idx`, tempo BPM = `n_beats × 60 / total_remix_duration`, filename tag `_remix_S30_R40_T15_<mode>.mid`)
 
 ## Moyen terme (Sprint)
 

@@ -26,9 +26,13 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use a3000_core::midi::generate_midi;
+use a3000_core::midi::{generate_midi, generate_midi_sequence, MidiEvent};
 use a3000_core::wav::{load_wave, WaveError};
 use a3000_onset::{detect_transients, DetectOptions};
+
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
 
 use crate::audio::{pcm16_le_to_mono_f32, Playback};
 use crate::theme::palette;
@@ -78,6 +82,49 @@ pub struct SlicerState {
     previewing_slice: Option<usize>,
     /// Fenêtre visible sur la waveform (zoom + pan). [start, end) en samples.
     view: ViewWindow,
+    /// === Remix === Pipeline 3 étages, chacun avec son intensité [0, 1].
+    /// Ordre d'application : Shuffle → Repeat → Stutter.
+    pub shuffle_mode: ShuffleMode,
+    pub shuffle_intensity: f32,
+    pub repeat_intensity: f32,
+    pub stutter_intensity: f32,
+    /// Graine du PRNG. Bumpée par le bouton "Regenerate".
+    pub remix_seed: u64,
+    /// Séquence courante après pipeline. Somme des durées = durée totale du
+    /// remix (peut différer de la loop d'origine si Repeat change le mapping).
+    pub remix_sequence: Vec<RemixStep>,
+    /// Dernier path MIDI remix généré (pour drag-out).
+    pub last_remix_midi_path: Option<PathBuf>,
+    /// True si le `Playback` courant joue le remix.
+    pub playing_remix: bool,
+}
+
+/// Stratégie de réordonnancement des slices pour l'étage Shuffle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShuffleMode {
+    /// Chaque position swap vers n'importe quelle autre avec proba `intensity`.
+    /// Chaotique, intéressant à intensité ≥ 0.4.
+    Random,
+    /// Ne swap que des slices à même position dans le beat (groupes
+    /// `i % n_beats`). Préserve la groove rythmique tout en changeant la
+    /// mélodie / l'arrangement.
+    BeatAligned,
+    /// Swap par paires adjacentes `(2k, 2k+1)`. Inverse kick-snare, etc.
+    /// Préserve la macro-structure.
+    PairSwap,
+    /// Découpe en blocs (4 slices à faible intensité, 2 à forte) et permute
+    /// les blocs entiers. Préserve les micro-patterns intra-bloc.
+    BlockReorder,
+}
+
+impl Default for ShuffleMode { fn default() -> Self { Self::Random } }
+
+#[derive(Clone, Copy, Debug)]
+pub struct RemixStep {
+    /// Index dans `state.onsets` de la slice jouée.
+    pub slice_idx: usize,
+    /// Durée du step en frames du buffer audio.
+    pub duration_frames: usize,
 }
 
 /// Distinguer un drag click-gauche (selected) d'un drag click-droit (marked).
@@ -179,6 +226,8 @@ impl SlicerState {
                 if self.n_beats == 0 {
                     self.n_beats = 16;
                 }
+                if self.remix_seed == 0 { self.remix_seed = 0xA3000; }
+                self.regenerate_remix();
             }
             Err(e) => {
                 self.error = Some(format_wav_err(&e));
@@ -272,6 +321,7 @@ impl SlicerState {
         self.playback = None;
         self.previewing_slice = None;
         self.view = ViewWindow { start: 0, end: audio.mono.len() };
+        self.regenerate_remix();
     }
 
     /// Cycle vers l'onset suivant (direction +1) ou précédent (-1) et centre
@@ -286,6 +336,287 @@ impl SlicerState {
         self.current_onset = Some(next);
         let target_sample = self.onsets[next];
         self.center_view_on(target_sample);
+    }
+
+    /// Rebuild la `remix_sequence` en appliquant le pipeline Shuffle → Repeat
+    /// → Stutter, chacun avec son intensité indépendante (0 = no-op). Le PRNG
+    /// est seedé une fois par `remix_seed` ; chaque étage consomme l'état
+    /// d'aléa séquentiellement → déterministe pour (seed, params, onsets).
+    pub fn regenerate_remix(&mut self) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.remix_sequence.clear();
+            return;
+        };
+        let total = audio.mono.len();
+        let n = self.onsets.len();
+        if n == 0 || total == 0 {
+            self.remix_sequence.clear();
+            return;
+        }
+        let durations: Vec<usize> = (0..n).map(|i| {
+            let s = self.onsets[i];
+            let e = self.onsets.get(i + 1).copied().unwrap_or(total).min(total);
+            e.saturating_sub(s)
+        }).collect();
+        let mut rng = ChaCha8Rng::seed_from_u64(self.remix_seed);
+        let mut seq: Vec<RemixStep> = (0..n).map(|i| RemixStep {
+            slice_idx: i,
+            duration_frames: durations[i],
+        }).collect();
+
+        // === Étage 1 : Shuffle ===
+        let si = self.shuffle_intensity.clamp(0.0, 1.0);
+        if si > 0.0 {
+            match self.shuffle_mode {
+                ShuffleMode::Random => {
+                    for i in 0..seq.len() {
+                        if rng.gen::<f32>() < si {
+                            let j = rng.gen_range(0..seq.len());
+                            seq.swap(i, j);
+                        }
+                    }
+                }
+                ShuffleMode::BeatAligned => {
+                    // Groupes par position dans le beat : (i % n_beats).
+                    // Préserve les downbeats à leur place de groupe.
+                    let groups = self.n_beats.max(1) as usize;
+                    for g in 0..groups {
+                        let in_group: Vec<usize> = (0..seq.len())
+                            .filter(|i| i % groups == g).collect();
+                        if in_group.len() < 2 { continue; }
+                        for &i in &in_group {
+                            if rng.gen::<f32>() < si {
+                                let j = in_group[rng.gen_range(0..in_group.len())];
+                                seq.swap(i, j);
+                            }
+                        }
+                    }
+                }
+                ShuffleMode::PairSwap => {
+                    let mut i = 0;
+                    while i + 1 < seq.len() {
+                        if rng.gen::<f32>() < si {
+                            seq.swap(i, i + 1);
+                        }
+                        i += 2;
+                    }
+                }
+                ShuffleMode::BlockReorder => {
+                    // Bloc 4 à intensité faible (préserve les patterns 4-on-the-floor),
+                    // bloc 2 à intensité haute (plus chaotique).
+                    let block_size = if si < 0.5 { 4 } else { 2 };
+                    let num_blocks = seq.len() / block_size;
+                    if num_blocks >= 2 {
+                        let original = seq.clone();
+                        let mut order: Vec<usize> = (0..num_blocks).collect();
+                        for i in 0..num_blocks {
+                            if rng.gen::<f32>() < si {
+                                let j = rng.gen_range(0..num_blocks);
+                                order.swap(i, j);
+                            }
+                        }
+                        for (new_b, &old_b) in order.iter().enumerate() {
+                            for k in 0..block_size {
+                                seq[new_b * block_size + k] =
+                                    original[old_b * block_size + k];
+                            }
+                        }
+                    }
+                }
+            }
+            // Réajuste les durées après shuffle (chaque step joue sa slice
+            // à sa durée native).
+            for step in seq.iter_mut() {
+                step.duration_frames = durations.get(step.slice_idx).copied().unwrap_or(0);
+            }
+        }
+
+        // === Étage 2 : Repeat (beat-repeat) ===
+        let ri = self.repeat_intensity.clamp(0.0, 1.0);
+        if ri > 0.0 {
+            for i in 1..seq.len() {
+                if rng.gen::<f32>() < ri {
+                    let source = if rng.gen::<bool>() {
+                        seq[i - 1].slice_idx
+                    } else {
+                        rng.gen_range(0..i)
+                    };
+                    seq[i].slice_idx = source;
+                    seq[i].duration_frames = durations.get(source).copied().unwrap_or(0);
+                }
+            }
+        }
+
+        // === Étage 3 : Stutter (subdivisions) ===
+        let ti = self.stutter_intensity.clamp(0.0, 1.0);
+        if ti > 0.0 {
+            let mut new_seq: Vec<RemixStep> = Vec::with_capacity(seq.len() * 2);
+            for step in &seq {
+                if rng.gen::<f32>() < ti {
+                    let k_max = (2.0 + ti * 6.0).round() as usize;
+                    let k = rng.gen_range(2..=k_max.max(2));
+                    let sub = step.duration_frames / k;
+                    if sub > 0 {
+                        for _ in 0..k {
+                            new_seq.push(RemixStep {
+                                slice_idx: step.slice_idx,
+                                duration_frames: sub,
+                            });
+                        }
+                        continue;
+                    }
+                }
+                new_seq.push(*step);
+            }
+            seq = new_seq;
+        }
+
+        self.remix_sequence = seq;
+        // Si on écoute le remix, restart pour entendre la nouvelle séquence
+        // immédiatement (rendu temps réel pendant qu'on bouge le slider).
+        if self.playing_remix {
+            if let Some(audio) = self.audio.as_ref() {
+                let sr = audio.sample_rate;
+                let ch = audio.channels;
+                let buf = self.render_remix_to_interleaved();
+                if !buf.is_empty() {
+                    self.playback = None;
+                    if let Ok(p) = Playback::start_loop(buf, sr, ch) {
+                        self.playback = Some(p);
+                    } else {
+                        self.playing_remix = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rend la séquence remix en audio interleaved f32 (préserve la stéréo)
+    /// en concaténant les frames PCM de chaque slice. Chaque step joue
+    /// `min(step.duration_frames, durée_native_slice)` frames depuis le
+    /// début de la slice → pour Stutter, seul le début de la slice
+    /// (transient) est joué, ce qui donne le caractère "stutter".
+    fn render_remix_to_interleaved(&self) -> Vec<f32> {
+        let Some(audio) = self.audio.as_ref() else { return Vec::new(); };
+        if self.remix_sequence.is_empty() || self.onsets.is_empty() {
+            return Vec::new();
+        }
+        let ch = usize::from(audio.channels.max(1));
+        let bpf = ch * 2;
+        let total_mono = audio.mono.len();
+        let inv_max = 1.0 / 32768.0_f32;
+        let estimated: usize = self.remix_sequence.iter()
+            .map(|s| s.duration_frames * ch).sum();
+        let mut out = Vec::with_capacity(estimated);
+        for step in &self.remix_sequence {
+            if step.slice_idx >= self.onsets.len() { continue; }
+            let start_frame = self.onsets[step.slice_idx];
+            let end_frame = self.onsets.get(step.slice_idx + 1).copied()
+                .unwrap_or(total_mono).min(total_mono);
+            let nat = end_frame.saturating_sub(start_frame);
+            let play_frames = step.duration_frames.min(nat);
+            let b0 = start_frame * bpf;
+            let b1 = ((start_frame + play_frames) * bpf).min(audio.pcm16_le.len());
+            for chunk in audio.pcm16_le[b0..b1].chunks_exact(2) {
+                let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                out.push((s as f32) * inv_max);
+            }
+        }
+        out
+    }
+
+    /// Toggle Play/Stop pour la preview du remix. Lit en boucle pour
+    /// pouvoir évaluer l'enchaînement à plusieurs reprises.
+    pub fn toggle_remix_playback(&mut self) {
+        if self.playback.is_some() && self.playing_remix {
+            self.playback = None;
+            self.playing_remix = false;
+            self.previewing_slice = None;
+            return;
+        }
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let sr = audio.sample_rate;
+        let ch = audio.channels;
+        let buf = self.render_remix_to_interleaved();
+        if buf.is_empty() {
+            self.error = Some("× remix vide".into());
+            return;
+        }
+        self.playback = None;
+        self.playing_remix = false;
+        match Playback::start_loop(buf, sr, ch) {
+            Ok(p) => {
+                self.playback = Some(p);
+                self.playing_remix = true;
+                self.previewing_slice = None;
+            }
+            Err(e) => self.error = Some(format!("× remix play: {e}")),
+        }
+    }
+
+    /// Écrit le remix courant en SMF dans `%TEMP%/a3000_slicer_remix_midi/
+    /// <stem>_remix_<algo>.mid`. Tempo synchronisé sur la longueur du remix
+    /// + `n_beats` pour que le DAW aligne sur sa grille à l'import.
+    pub fn generate_remix_midi_file(&mut self) -> Result<PathBuf, String> {
+        let audio = self.audio.as_ref().ok_or("Aucun fichier audio chargé")?;
+        if self.remix_sequence.is_empty() {
+            return Err("Séquence remix vide".into());
+        }
+        let sr = audio.sample_rate.max(1);
+        let total_remix_frames: usize = self.remix_sequence.iter()
+            .map(|s| s.duration_frames).sum();
+        if total_remix_frames == 0 {
+            return Err("Durée remix nulle".into());
+        }
+        let total_dur_sec = total_remix_frames as f64 / f64::from(sr);
+        let n_beats = self.n_beats.max(1);
+        let bpm = if total_dur_sec > 0.0 { f64::from(n_beats) * 60.0 / total_dur_sec } else { 120.0 };
+        let ppq: u32 = 480;
+        let sec_to_ticks = |s: f64| -> u32 { (s * bpm / 60.0 * f64::from(ppq)).round() as u32 };
+
+        let base_note: u32 = 36; // C2 — même mapping que generate_midi_file
+        let mut events: Vec<MidiEvent> = Vec::with_capacity(self.remix_sequence.len());
+        let mut cursor_frames: usize = 0;
+        for step in &self.remix_sequence {
+            let start_sec = cursor_frames as f64 / f64::from(sr);
+            let end_frames = cursor_frames + step.duration_frames;
+            let end_sec = end_frames as f64 / f64::from(sr);
+            let note = (base_note + step.slice_idx as u32).min(127) as u8;
+            events.push((note, sec_to_ticks(start_sec), sec_to_ticks(end_sec)));
+            cursor_frames = end_frames;
+        }
+
+        let stem = self.source_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("slicer")
+            .to_string();
+        let track_name: String = stem.chars().take(32).collect();
+        let bytes = generate_midi_sequence(&events, bpm, &track_name)
+            .map_err(|e| format!("MIDI remix : {e}"))?;
+
+        let dir = std::env::temp_dir().join("a3000_slicer_remix_midi");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
+        let safe_stem: String = stem.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        // Tag : `_remix_S30_R40_T15_random.mid` — intensités (00-99) +
+        // mode shuffle (lowercase) → traçabilité du fichier exporté.
+        let s = (self.shuffle_intensity.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let r = (self.repeat_intensity.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let t = (self.stutter_intensity.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let mode_tag = match self.shuffle_mode {
+            ShuffleMode::Random => "rnd",
+            ShuffleMode::BeatAligned => "beat",
+            ShuffleMode::PairSwap => "pair",
+            ShuffleMode::BlockReorder => "blk",
+        };
+        let path = dir.join(format!(
+            "{safe_stem}_remix_S{s:02}_R{r:02}_T{t:02}_{mode_tag}.mid"
+        ));
+        std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
+        self.last_remix_midi_path = Some(path.clone());
+        Ok(path)
     }
 
     /// Relance la détection d'onsets sur le buffer courant (post-Delete
@@ -305,6 +636,7 @@ impl SlicerState {
         self.dragging_onset = None;
         self.current_onset = None;
         self.previewing_slice = None;
+        self.regenerate_remix();
     }
 
     /// Insère une séparation à la position `sample` (en frames). Indices de
@@ -328,6 +660,7 @@ impl SlicerState {
         if let Some(c) = self.current_onset.as_mut() { if *c >= idx { *c += 1; } }
         if let Some(p) = self.previewing_slice.as_mut() { if *p >= idx { *p += 1; } }
         self.peaks_cache = None;
+        self.regenerate_remix();
     }
 
     /// Supprime la séparation à l'index `idx` (la slice idx-1 absorbe l'idx).
@@ -351,6 +684,7 @@ impl SlicerState {
                 else if p > idx { Some(p - 1) } else { Some(p) };
         }
         self.peaks_cache = None;
+        self.regenerate_remix();
     }
 
     fn center_view_on(&mut self, sample: usize) {
@@ -518,6 +852,7 @@ impl SlicerState {
         if self.playback.is_some() {
             self.playback = None;
             self.previewing_slice = None;
+            self.playing_remix = false;
             return;
         }
         let Some(audio) = self.audio.as_ref() else { return; };
@@ -526,6 +861,7 @@ impl SlicerState {
             Ok(p) => {
                 self.playback = Some(p);
                 self.previewing_slice = None; // Loop full = pas de slice spécifique
+                self.playing_remix = false;
             }
             Err(e) => self.error = Some(format!("Playback : {e}")),
         }
@@ -534,6 +870,7 @@ impl SlicerState {
     pub fn stop_playback(&mut self) {
         self.playback = None;
         self.previewing_slice = None;
+        self.playing_remix = false;
     }
 
     /// Joue la slice contenant le sample `pos` (lecture one-shot, pas en boucle).
@@ -552,6 +889,7 @@ impl SlicerState {
         let slice = crate::audio::pcm16_le_bytes_to_interleaved_f32(&audio.pcm16_le[b0..b1]);
         let sr = audio.sample_rate;
         self.playback = None;
+        self.playing_remix = false;
         match Playback::start_oneshot(slice, sr, audio.channels) {
             Ok(p) => {
                 self.playback = Some(p);
@@ -750,6 +1088,8 @@ fn show_top_bar(ui: &mut egui::Ui, state: &mut SlicerState) {
 const CELL_H: f32 = 22.0;
 const WAVEFORM_H: f32 = 200.0;
 const ONSET_HIT_PX: f32 = 5.0;
+const REMIX_STRIP_H: f32 = 26.0;
+const REMIX_CONTROLS_H: f32 = 32.0;
 
 fn show_canvas(ui: &mut egui::Ui, state: &mut SlicerState) {
     let avail_w = ui.available_width().max(100.0);
@@ -762,10 +1102,13 @@ fn show_canvas(ui: &mut egui::Ui, state: &mut SlicerState) {
     handle_cells_interaction(state, &cells_rect, &cells_resp);
     paint_cells(ui, state, cells_rect);
 
-    // 2. Waveform (en dessous)
+    // 2. Waveform (en dessous) — hauteur adaptative pour laisser de la place
+    //    à la section remix + controls en bas.
     ui.add_space(2.0);
+    let remix_block_h = 8.0 + REMIX_STRIP_H + 4.0 + REMIX_CONTROLS_H;
+    let wave_h = (ui.available_height() - remix_block_h).clamp(80.0, WAVEFORM_H);
     let (wave_rect, wave_resp) = ui.allocate_exact_size(
-        egui::vec2(avail_w, WAVEFORM_H),
+        egui::vec2(avail_w, wave_h),
         egui::Sense::click_and_drag(),
     );
 
@@ -786,6 +1129,209 @@ fn show_canvas(ui: &mut egui::Ui, state: &mut SlicerState) {
     }
 
     paint_waveform(ui, state, wave_rect);
+
+    // 3. Remix section : strip + controls. Sous la waveform, dans le même
+    //    bloc canvas (pas de coût layout supplémentaire — l'espace est déjà
+    //    réservé par FOOTER_RESERVED_H).
+    ui.add_space(8.0);
+    let (remix_rect, _) = ui.allocate_exact_size(
+        egui::vec2(avail_w, REMIX_STRIP_H),
+        egui::Sense::hover(),
+    );
+    paint_remix_strip(ui, state, remix_rect);
+
+    ui.add_space(4.0);
+    show_remix_controls(ui, state);
+}
+
+/// Dessine la strip remix : un rectangle coloré par step, largeur ∝ durée
+/// du step. La couleur de chaque step encode le `slice_idx` (rotation HSV
+/// par angle d'or). Numérote chaque box visible (idx slice + 1) si la
+/// largeur le permet.
+fn paint_remix_strip(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, palette::BG_PANEL_LIGHT);
+    if state.remix_sequence.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "(remix)",
+            egui::FontId::proportional(11.0),
+            palette::FG_DIM,
+        );
+        return;
+    }
+    let total_frames: usize = state.remix_sequence.iter()
+        .map(|s| s.duration_frames).sum();
+    if total_frames == 0 { return; }
+    let n_slices = state.onsets.len().max(1);
+    let mut cursor_f: usize = 0;
+    for step in &state.remix_sequence {
+        let x0 = rect.left()
+            + (cursor_f as f32 / total_frames as f32) * rect.width();
+        cursor_f += step.duration_frames;
+        let x1 = rect.left()
+            + (cursor_f as f32 / total_frames as f32) * rect.width();
+        if x1 - x0 < 1.0 { continue; }
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(x0 + 1.0, rect.top() + 2.0),
+            egui::pos2(x1 - 1.0, rect.bottom() - 2.0),
+        );
+        let fill = slice_color(step.slice_idx, n_slices);
+        painter.rect_filled(cell, 1.5, fill);
+        if cell.width() >= 18.0 {
+            painter.text(
+                cell.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}", step.slice_idx + 1),
+                egui::FontId::proportional(10.0),
+                egui::Color32::BLACK,
+            );
+        }
+    }
+    // Playhead pendant la preview remix.
+    if state.playing_remix {
+        if let Some(pb) = &state.playback {
+            let frac = pb.position_fraction();
+            let x = rect.left() + frac * rect.width();
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                egui::Stroke::new(2.0, palette::ACCENT_ORANGE),
+            );
+        }
+    }
+}
+
+/// Couleur HSV → RGB pour un slice_idx. Angle d'or pour bonne distribution.
+fn slice_color(idx: usize, total: usize) -> egui::Color32 {
+    let total = total.max(1) as f32;
+    let h = ((idx as f32 * 0.61803398875) % 1.0) * 360.0;
+    let s = 0.55;
+    let v = 0.85 + 0.10 * (idx as f32 / total);
+    let (r, g, b) = hsv_to_rgb(h, s, v.min(1.0));
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let c = v * s;
+    let h6 = (h / 60.0).rem_euclid(6.0);
+    let x = c * (1.0 - (h6 % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h6 as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    (((r1 + m) * 255.0) as u8, ((g1 + m) * 255.0) as u8, ((b1 + m) * 255.0) as u8)
+}
+
+fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
+    let has_audio = state.audio.is_some();
+    let has_slices = !state.onsets.is_empty();
+    let enabled = has_audio && has_slices;
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.label(egui::RichText::new("Remix").color(palette::FG_DIM).strong());
+            // Play/Stop
+            let playing = state.playing_remix;
+            let play_label = if playing { "Stop" } else { "Play" };
+            let play_fill = if playing { palette::ACCENT_ORANGE } else { palette::ACCENT_GREEN };
+            let play_btn = egui::Button::new(
+                egui::RichText::new(play_label).color(egui::Color32::WHITE),
+            ).fill(play_fill);
+            if ui.add_sized([60.0, REMIX_CONTROLS_H - 4.0], play_btn).clicked() {
+                state.toggle_remix_playback();
+            }
+            let mut changed = false;
+
+            // Mode shuffle (ComboBox compact)
+            let mode_label = match state.shuffle_mode {
+                ShuffleMode::Random => "Random",
+                ShuffleMode::BeatAligned => "Beat-aligned",
+                ShuffleMode::PairSwap => "Pair-swap",
+                ShuffleMode::BlockReorder => "Block-reorder",
+            };
+            egui::ComboBox::from_id_source("shuffle_mode")
+                .selected_text(mode_label)
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for (m, l) in [
+                        (ShuffleMode::Random, "Random"),
+                        (ShuffleMode::BeatAligned, "Beat-aligned"),
+                        (ShuffleMode::PairSwap, "Pair-swap"),
+                        (ShuffleMode::BlockReorder, "Block-reorder"),
+                    ] {
+                        if ui.selectable_label(state.shuffle_mode == m, l).clicked() {
+                            if state.shuffle_mode != m {
+                                state.shuffle_mode = m;
+                                changed = true;
+                            }
+                        }
+                    }
+                });
+
+            // 3 sliders compacts : Shuffle / Repeat / Stutter
+            let r1 = ui.add(
+                egui::Slider::new(&mut state.shuffle_intensity, 0.0..=1.0)
+                    .show_value(true).fixed_decimals(2).text("Sh")
+            );
+            let r2 = ui.add(
+                egui::Slider::new(&mut state.repeat_intensity, 0.0..=1.0)
+                    .show_value(true).fixed_decimals(2).text("Rp")
+            );
+            let r3 = ui.add(
+                egui::Slider::new(&mut state.stutter_intensity, 0.0..=1.0)
+                    .show_value(true).fixed_decimals(2).text("St")
+            );
+            if r1.changed() || r2.changed() || r3.changed() { changed = true; }
+
+            if ui.button("↻").on_hover_text("Regenerate (new seed)").clicked() {
+                state.remix_seed = state.remix_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                changed = true;
+            }
+            if changed {
+                state.regenerate_remix();
+            }
+        });
+
+        // Drag MIDI à droite (flush right) — drag-out OLE comme le bouton
+        // MIDI standard.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            #[cfg(windows)]
+            {
+                let drag_resp = drag_remix_midi_button(ui, enabled, REMIX_CONTROLS_H);
+                if drag_resp.drag_started() {
+                    match state.generate_remix_midi_file() {
+                        Ok(p) => match crate::ole_drag::drag_file(&p) {
+                            Ok(eff) if eff.0 != 0 => {
+                                state.error = Some(format!("Remix MIDI déposé ({} steps)", state.remix_sequence.len()));
+                            }
+                            Ok(_) => { state.error = Some("Remix MIDI : drag annulé".into()); }
+                            Err(e) => state.error = Some(format!("× drag remix: {e}")),
+                        },
+                        Err(e) => state.error = Some(format!("× {e}")),
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = ui.add_enabled(enabled, egui::Button::new("↓ Drag MIDI Remix"));
+            }
+        });
+    });
+}
+
+#[cfg(windows)]
+fn drag_remix_midi_button(ui: &mut egui::Ui, enabled: bool, h: f32) -> egui::Response {
+    let btn = egui::Button::new(
+        egui::RichText::new("↓ Drag MIDI Remix").color(egui::Color32::WHITE),
+    ).fill(palette::BUTTON_MIDI);
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.add_sized([170.0, h], btn).interact(egui::Sense::click_and_drag())
+    }).inner
 }
 
 /// Wheel sur la waveform → zoom (anchor = curseur).

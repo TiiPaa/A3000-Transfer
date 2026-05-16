@@ -44,6 +44,10 @@ zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
 
+# PRNG déterministe pour la fonction Remix du Slicer
+rand.workspace = true
+rand_chacha.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 windows-core.workspace = true

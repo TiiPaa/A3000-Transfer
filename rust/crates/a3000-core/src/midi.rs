@@ -133,6 +133,81 @@ pub fn generate_midi(
     Ok(buf)
 }
 
+/// Évènement MIDI absolu pour `generate_midi_sequence` : `(note, start_tick, end_tick)`.
+/// Les ticks sont exprimés relativement au PPQ de `generate_midi_sequence` (480 par défaut).
+pub type MidiEvent = (u8, u32, u32);
+
+/// Génère un SMF Type 1 à partir d'une **liste de plays absolus**
+/// `(note, start_tick, end_tick)`. Utilisé par la fonction Remix du slicer :
+/// chaque step joue une slice (note = `C2 + slice_idx`) à un instant donné
+/// avec sa propre durée. Les events ne doivent pas se chevaucher pour rendre
+/// proprement dans tous les DAW.
+///
+/// # Errors
+/// `EmptyOnsets` si la liste est vide, `Write` si l'encodage SMF échoue.
+pub fn generate_midi_sequence(
+    events: &[MidiEvent],
+    bpm: f64,
+    track_name: &str,
+) -> Result<Vec<u8>, MidiError> {
+    if events.is_empty() {
+        return Err(MidiError::EmptyOnsets);
+    }
+    let mut sorted: Vec<MidiEvent> = events.to_vec();
+    sorted.sort_by_key(|e| e.1);
+
+    let bpm = if bpm > 0.0 { bpm } else { 120.0 };
+    let tempo_us = ((60_000_000.0 / bpm).round() as u32).min(0x00FF_FFFF);
+    let ppq: u16 = 480;
+    let header = Header::new(Format::Parallel, Timing::Metrical(u15::from(ppq)));
+
+    let name: String = track_name.chars().take(32).collect();
+    let name_bytes: &[u8] = name.as_bytes();
+
+    let mut track: Vec<TrackEvent<'_>> = Vec::with_capacity(3 + sorted.len() * 2);
+    track.push(TrackEvent {
+        delta: u28::from(0_u32),
+        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(tempo_us))),
+    });
+    track.push(TrackEvent {
+        delta: u28::from(0_u32),
+        kind: TrackEventKind::Meta(MetaMessage::TrackName(name_bytes)),
+    });
+
+    let mut last_tick: u32 = 0;
+    for (note, start_tick, end_tick) in sorted {
+        let note = note.min(127);
+        let end_tick = end_tick.max(start_tick + 1);
+        let delta_on = start_tick.saturating_sub(last_tick);
+        let delta_off = end_tick - start_tick;
+        track.push(TrackEvent {
+            delta: u28::from(delta_on),
+            kind: TrackEventKind::Midi {
+                channel: u4::from(0),
+                message: MidiMessage::NoteOn { key: u7::from(note), vel: u7::from(100) },
+            },
+        });
+        track.push(TrackEvent {
+            delta: u28::from(delta_off),
+            kind: TrackEventKind::Midi {
+                channel: u4::from(0),
+                message: MidiMessage::NoteOff { key: u7::from(note), vel: u7::from(0) },
+            },
+        });
+        last_tick = end_tick;
+    }
+    track.push(TrackEvent {
+        delta: u28::from(0_u32),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+
+    let mut smf = Smf::new(header);
+    smf.tracks.push(track);
+    let mut buf = Vec::new();
+    smf.write_std(&mut buf).map_err(|e| MidiError::Write(e.to_string()))?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

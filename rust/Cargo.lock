@@ -16,6 +16,8 @@ dependencies = [
  "egui_extras",
  "flate2",
  "hound",
+ "rand",
+ "rand_chacha",
  "serde",
  "serde_json",
  "tar",
