@@ -112,7 +112,15 @@ impl ViewWindow {
 pub struct AudioData {
     pub sample_rate: u32,
     pub channels: u16,
+    /// Buffer mono [-1, 1] : utilisé pour la détection d'onsets, le rendu
+    /// de la waveform, la preview playback, et tous les calculs d'indices
+    /// (les onsets sont en unités de frames = `mono.len()` units).
     pub mono: Vec<f32>,
+    /// PCM 16-bit LE interleaved (frames × channels × 2 octets) — copie de
+    /// `WavePayload.pcm_data`. Conservé pour préserver la stéréo dans
+    /// `export_slices_to_wavs` (mirror du Python `audio[start:end]` qui
+    /// écrit la slice avec son `channels` d'origine). Cf. engine.py:174.
+    pub pcm16_le: Vec<u8>,
     pub duration_s: f64,
 }
 
@@ -157,6 +165,7 @@ impl SlicerState {
                     sample_rate,
                     channels,
                     mono,
+                    pcm16_le: payload.pcm_data,
                     duration_s,
                 });
                 self.view = ViewWindow { start: 0, end: mono_len };
@@ -213,7 +222,9 @@ impl SlicerState {
             return;
         }
         let total = audio.mono.len();
+        let bytes_per_frame = usize::from(audio.channels.max(1)) * 2;
         let mut new_audio: Vec<f32> = Vec::with_capacity(total);
+        let mut new_pcm: Vec<u8> = Vec::with_capacity(audio.pcm16_le.len());
         let mut new_onsets: Vec<usize> = Vec::with_capacity(self.onsets.len());
 
         for i in 0..self.onsets.len() {
@@ -225,6 +236,11 @@ impl SlicerState {
                 if start < end && start < total {
                     let end = end.min(total);
                     new_audio.extend_from_slice(&audio.mono[start..end]);
+                    let b0 = start * bytes_per_frame;
+                    let b1 = (end * bytes_per_frame).min(audio.pcm16_le.len());
+                    if b0 < b1 {
+                        new_pcm.extend_from_slice(&audio.pcm16_le[b0..b1]);
+                    }
                 }
             }
         }
@@ -233,6 +249,7 @@ impl SlicerState {
         // empty avec onsets[0]=0 incohérents : on assure au moins qu'onsets
         // est consistant.
         audio.mono = new_audio;
+        audio.pcm16_le = new_pcm;
         audio.duration_s = audio.mono.len() as f64 / audio.sample_rate.max(1) as f64;
 
         self.onsets = new_onsets;
@@ -278,9 +295,10 @@ impl SlicerState {
     }
 
     /// Découpe le buffer audio aux onsets et écrit chaque slice (non marquée)
-    /// comme un fichier WAV mono 16-bit dans
-    /// `%TEMP%/a3000_slicer_slices/<stem>_slice_NNN.wav`. Retourne la liste
-    /// des paths générés (ou une erreur stringifiée).
+    /// comme un fichier WAV 16-bit dans
+    /// `%TEMP%/a3000_slicer_slices/<stem>_slice_NNN.wav`. Les slices sont
+    /// écrites avec le nombre de canaux du fichier source (préserve la
+    /// stéréo — mirror du Python `engine.py:174` `chunk = audio[start:end]`).
     pub fn export_slices_to_wavs(&self) -> Result<Vec<PathBuf>, String> {
         let audio = self.audio.as_ref().ok_or("Aucun fichier audio chargé")?;
         if self.onsets.is_empty() {
@@ -298,10 +316,12 @@ impl SlicerState {
         std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
 
         let total = audio.mono.len();
+        let channels = audio.channels.max(1);
+        let bytes_per_frame = usize::from(channels) * 2;
         let n = self.onsets.len();
         let n_digits = (n.to_string().len()).max(3);
         let spec = hound::WavSpec {
-            channels: 1,
+            channels,
             sample_rate: audio.sample_rate,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
@@ -332,9 +352,13 @@ impl SlicerState {
             ));
             let mut writer = hound::WavWriter::create(&path, spec)
                 .map_err(|e| format!("WAV {}: {e}", path.display()))?;
-            for &s in &audio.mono[start..end] {
-                let s16 = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                writer.write_sample(s16)
+            // Slice interleaved : pour chaque frame [start..end], écrit les
+            // `channels` samples i16 LE consécutifs depuis pcm16_le.
+            let b0 = start * bytes_per_frame;
+            let b1 = (end * bytes_per_frame).min(audio.pcm16_le.len());
+            for chunk in audio.pcm16_le[b0..b1].chunks_exact(2) {
+                let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                writer.write_sample(s)
                     .map_err(|e| format!("write_sample: {e}"))?;
             }
             writer.finalize()
@@ -425,7 +449,8 @@ impl SlicerState {
             return;
         }
         let Some(audio) = self.audio.as_ref() else { return; };
-        match Playback::start_loop(audio.mono.clone(), audio.sample_rate) {
+        let interleaved = crate::audio::pcm16_le_bytes_to_interleaved_f32(&audio.pcm16_le);
+        match Playback::start_loop(interleaved, audio.sample_rate, audio.channels) {
             Ok(p) => {
                 self.playback = Some(p);
                 self.previewing_slice = None; // Loop full = pas de slice spécifique
@@ -449,10 +474,13 @@ impl SlicerState {
         let start = self.onsets[idx];
         let end = self.onsets.get(idx + 1).copied().unwrap_or(total).min(total);
         if start >= end { return; }
-        let slice: Vec<f32> = audio.mono[start..end].to_vec();
+        let bytes_per_frame = usize::from(audio.channels.max(1)) * 2;
+        let b0 = start * bytes_per_frame;
+        let b1 = (end * bytes_per_frame).min(audio.pcm16_le.len());
+        let slice = crate::audio::pcm16_le_bytes_to_interleaved_f32(&audio.pcm16_le[b0..b1]);
         let sr = audio.sample_rate;
         self.playback = None;
-        match Playback::start_oneshot(slice, sr) {
+        match Playback::start_oneshot(slice, sr, audio.channels) {
             Ok(p) => {
                 self.playback = Some(p);
                 self.previewing_slice = Some(idx);

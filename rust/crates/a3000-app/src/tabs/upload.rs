@@ -22,7 +22,7 @@ use eframe::egui;
 
 use a3000_core::wav::{load_wave, peek_wave_metadata};
 
-use crate::audio::{pcm16_le_to_mono_f32, Playback};
+use crate::audio::{pcm16_le_to_interleaved_f32, Playback};
 use crate::config::Config;
 use crate::theme::palette;
 
@@ -195,13 +195,14 @@ impl UploadState {
             return;
         }
         // Charge le WAV via a3000_core::wav::load_wave (PCM 16-bit LE) puis
-        // convertit en mono f32 via le helper partagé.
+        // convertit en interleaved f32 (préserve la stéréo).
         match load_wave(&item.path) {
             Ok(payload) => {
-                let mono = pcm16_le_to_mono_f32(&payload);
+                let interleaved = pcm16_le_to_interleaved_f32(&payload);
                 let sr = payload.sample_rate;
+                let ch = payload.channels;
                 self.playback = None;
-                match Playback::start_oneshot(mono, sr) {
+                match Playback::start_oneshot(interleaved, sr, ch) {
                     Ok(p) => {
                         self.playback = Some(p);
                         self.playing_idx = Some(idx);

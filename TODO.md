@@ -43,6 +43,8 @@ Démarrage instantané (pas de JIT numba à warmup). Tous les chemins Python por
 - [x] Upload : preview audio par item — bouton play/stop par row (icône peinte triangle/carré pour centrage pixel-perfect, glyphs Unicode `▶`/`■` ont des galleys asymétriques) à droite du Sample name ; row highlight jaune pendant la lecture ; oneshot, stop auto à la fin
 - [x] Upload : preview audio via click sur le nom du fichier (curseur PointingHand + tooltip Play/Stop) ; colonne Play séparée supprimée
 - [x] Fix UI : checkbox tronquée à gauche dans tables Upload/Download — le focus stroke / hover ring d'egui dépasse de ~2 px le box visible et était rogné par le `clip_rect` strict du cell. Fix : `CHECKBOX_LEFT_PAD = 6.0` + `ui.add_space(CHECKBOX_LEFT_PAD)` au début de chaque cell checkbox (header + rows)
+- [x] Fix Slicer : conversion 24→16 perdait la stéréo (sample sur A3000 en 1ch). Le Slicer Rust convertissait en mono à `load` puis exportait depuis `audio.mono`. Python (`engine.py:174`) garde l'audio original et n'utilise mono que pour la détection d'onsets. Fix : ajout de `AudioData.pcm16_le: Vec<u8>` (interleaved bytes du source), export depuis `pcm16_le[start*ch*2..end*ch*2]` avec `channels: audio.channels` ; `delete_marked` rebuild les deux buffers en parallèle
+- [x] Preview audio stéréo : `Playback` accepte maintenant un buffer interleaved f32 + `src_channels` ; routage mono→repli sur tous les canaux device / stéréo + device ≥2ch → L=ch0 R=ch1 / stéréo + device mono → downmix (L+R)/2. Slicer Loop, preview slice et Upload preview passent par `pcm16_le_to_interleaved_f32` / `pcm16_le_bytes_to_interleaved_f32`
 
 ## Moyen terme (Sprint)
 
