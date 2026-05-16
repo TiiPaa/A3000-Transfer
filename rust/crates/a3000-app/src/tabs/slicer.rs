@@ -46,6 +46,9 @@ pub struct SlicerState {
     /// n'exporte QUE les slices sélectionnées (mode "filter").
     pub selected: Vec<bool>,
     pub n_beats: u32,
+    /// Sensibilité de détection des transients (cf. `a3000_onset::DetectOptions`).
+    /// Plus haute → plus d'onsets détectés. Plage UI : 0.2 → 3.0, défaut 1.0.
+    pub sensitivity: f32,
     pub error: Option<String>,
     /// Cache des bins de peaks. Invalidé quand la largeur du widget change.
     peaks_cache: Option<PeaksCache>,
@@ -156,7 +159,11 @@ impl SlicerState {
                 let channels = payload.channels.max(1);
                 let mono_len = mono.len();
                 let duration_s = mono_len as f64 / sample_rate.max(1) as f64;
-                let opts = DetectOptions::default();
+                if self.sensitivity <= 0.0 { self.sensitivity = 1.0; }
+                let opts = DetectOptions {
+                    sensitivity: self.sensitivity,
+                    ..DetectOptions::default()
+                };
                 self.onsets = detect_transients(&mono, sample_rate, &opts);
                 self.marked = vec![false; self.onsets.len()];
                 self.selected = vec![false; self.onsets.len()];
@@ -279,6 +286,71 @@ impl SlicerState {
         self.current_onset = Some(next);
         let target_sample = self.onsets[next];
         self.center_view_on(target_sample);
+    }
+
+    /// Relance la détection d'onsets sur le buffer courant (post-Delete
+    /// marked si applicable) avec la sensibilité courante. Efface les
+    /// sélections/marquages utilisateur (les indices ne correspondent plus).
+    pub fn redetect(&mut self) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        if self.sensitivity <= 0.0 { self.sensitivity = 1.0; }
+        let opts = DetectOptions {
+            sensitivity: self.sensitivity,
+            ..DetectOptions::default()
+        };
+        self.onsets = detect_transients(&audio.mono, audio.sample_rate, &opts);
+        self.marked = vec![false; self.onsets.len()];
+        self.selected = vec![false; self.onsets.len()];
+        self.peaks_cache = None;
+        self.dragging_onset = None;
+        self.current_onset = None;
+        self.previewing_slice = None;
+    }
+
+    /// Insère une séparation à la position `sample` (en frames). Indices de
+    /// drag/nav/preview sont décalés pour rester valides. Mirror Python :
+    /// `view.py::_add_onset_at`.
+    pub fn add_onset_at_sample(&mut self, sample: usize) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let total = audio.mono.len();
+        if total == 0 { return; }
+        let sample = sample.clamp(1, total.saturating_sub(1));
+        let idx = self.onsets.partition_point(|&o| o < sample);
+        if idx < self.onsets.len() && self.onsets[idx] == sample {
+            return;
+        }
+        self.onsets.insert(idx, sample);
+        // Nouvelle slice : par défaut ni selected ni marked (le 1er demi de la
+        // slice parente conserve son état, le 2nd demi part vierge).
+        self.selected.insert(idx, false);
+        self.marked.insert(idx, false);
+        if let Some(d) = self.dragging_onset.as_mut() { if *d >= idx { *d += 1; } }
+        if let Some(c) = self.current_onset.as_mut() { if *c >= idx { *c += 1; } }
+        if let Some(p) = self.previewing_slice.as_mut() { if *p >= idx { *p += 1; } }
+        self.peaks_cache = None;
+    }
+
+    /// Supprime la séparation à l'index `idx` (la slice idx-1 absorbe l'idx).
+    /// L'onset 0 (début de l'audio) n'est jamais supprimé. Mirror Python :
+    /// `view.py::_delete_onset`.
+    pub fn delete_onset(&mut self, idx: usize) {
+        if idx == 0 || idx >= self.onsets.len() { return; }
+        self.onsets.remove(idx);
+        self.selected.remove(idx);
+        self.marked.remove(idx);
+        if let Some(d) = self.dragging_onset {
+            self.dragging_onset = if d == idx { None }
+                else if d > idx { Some(d - 1) } else { Some(d) };
+        }
+        if let Some(c) = self.current_onset {
+            self.current_onset = if c == idx { None }
+                else if c > idx { Some(c - 1) } else { Some(c) };
+        }
+        if let Some(p) = self.previewing_slice {
+            self.previewing_slice = if p == idx { None }
+                else if p > idx { Some(p - 1) } else { Some(p) };
+        }
+        self.peaks_cache = None;
     }
 
     fn center_view_on(&mut self, sample: usize) {
@@ -1020,6 +1092,26 @@ fn handle_waveform_interaction(
             }
         }
     }
+
+    // Click droit sur la waveform : près d'un onset → supprime, ailleurs →
+    // ajoute. Mirror Python view.py:407-415. L'onset 0 ne peut pas être
+    // supprimé (delete_onset filtre idx == 0).
+    if resp.clicked_by(egui::PointerButton::Secondary) {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let near_onset = state.onsets.iter().enumerate()
+                .find(|(_, &o)| {
+                    sample_to_x(o).map(|x| (x - p.x).abs() < ONSET_HIT_PX).unwrap_or(false)
+                })
+                .map(|(i, _)| i);
+            match near_onset {
+                Some(idx) if idx > 0 => state.delete_onset(idx),
+                _ => {
+                    let sample = x_to_sample(p.x);
+                    state.add_onset_at_sample(sample);
+                }
+            }
+        }
+    }
 }
 
 fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
@@ -1101,7 +1193,7 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
     let export_count = if selected > 0 { selected } else { total.saturating_sub(marked) };
     let midi_enabled = has_audio && has_slices;
 
-    // Ligne 1 : compteurs sélection / suppression / total.
+    // Ligne 1 : compteurs (gauche) + slider Sensitivity (droite, flush right).
     ui.horizontal(|ui| {
         if total > 0 {
             ui.label(
@@ -1111,6 +1203,22 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
                 )).color(palette::FG_DIM),
             );
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Slider 0.2 → 3.0 (mirror Python view.py:209-212). Plus haut →
+            // plus d'onsets. Re-détecte sur changement → wipe les sélections.
+            if state.sensitivity <= 0.0 { state.sensitivity = 1.0; }
+            let resp = ui.add_enabled(
+                has_audio,
+                egui::Slider::new(&mut state.sensitivity, 0.2..=3.0)
+                    .show_value(true)
+                    .fixed_decimals(2)
+                    .text("")
+            );
+            ui.label(egui::RichText::new("Sensitivity").color(palette::FG_DIM));
+            if resp.changed() {
+                state.redetect();
+            }
+        });
     });
 
     ui.add_space(2.0);
