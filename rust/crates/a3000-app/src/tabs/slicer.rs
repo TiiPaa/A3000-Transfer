@@ -50,6 +50,10 @@ pub struct SlicerState {
     /// n'exporte QUE les slices sélectionnées (mode "filter").
     pub selected: Vec<bool>,
     pub n_beats: u32,
+    /// Subdivision pour la fonction "Beat slice" : nombre de slices par beat.
+    /// Total d'onsets générés = `n_beats × slices_per_beat`. Plage UI typique :
+    /// 1, 2, 3, 4, 6, 8, 16. Défaut 4 (= sixteenth notes si beat = noire).
+    pub slices_per_beat: u32,
     /// Sensibilité de détection des transients (cf. `a3000_onset::DetectOptions`).
     /// Plus haute → plus d'onsets détectés. Plage UI : 0.2 → 3.0, défaut 1.0.
     pub sensitivity: f32,
@@ -102,18 +106,14 @@ pub struct SlicerState {
 /// Stratégie de réordonnancement des slices pour l'étage Shuffle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShuffleMode {
-    /// Chaque position swap vers n'importe quelle autre avec proba `intensity`.
-    /// Chaotique, intéressant à intensité ≥ 0.4.
+    /// Chaque position swap vers une autre avec proba `intensity`. Chaotique
+    /// au-delà de ~0.4.
     Random,
-    /// Ne swap que des slices à même position dans le beat (groupes
-    /// `i % n_beats`). Préserve la groove rythmique tout en changeant la
-    /// mélodie / l'arrangement.
-    BeatAligned,
-    /// Swap par paires adjacentes `(2k, 2k+1)`. Inverse kick-snare, etc.
-    /// Préserve la macro-structure.
+    /// Swap par paires adjacentes `(2k, 2k+1)`. Inverse kick-snare etc.,
+    /// préserve la macro-structure.
     PairSwap,
     /// Découpe en blocs (4 slices à faible intensité, 2 à forte) et permute
-    /// les blocs entiers. Préserve les micro-patterns intra-bloc.
+    /// les blocs entiers.
     BlockReorder,
 }
 
@@ -227,6 +227,7 @@ impl SlicerState {
                     self.n_beats = 16;
                 }
                 if self.remix_seed == 0 { self.remix_seed = 0xA3000; }
+                if self.slices_per_beat == 0 { self.slices_per_beat = 4; }
                 self.regenerate_remix();
             }
             Err(e) => {
@@ -376,22 +377,6 @@ impl SlicerState {
                         }
                     }
                 }
-                ShuffleMode::BeatAligned => {
-                    // Groupes par position dans le beat : (i % n_beats).
-                    // Préserve les downbeats à leur place de groupe.
-                    let groups = self.n_beats.max(1) as usize;
-                    for g in 0..groups {
-                        let in_group: Vec<usize> = (0..seq.len())
-                            .filter(|i| i % groups == g).collect();
-                        if in_group.len() < 2 { continue; }
-                        for &i in &in_group {
-                            if rng.gen::<f32>() < si {
-                                let j = in_group[rng.gen_range(0..in_group.len())];
-                                seq.swap(i, j);
-                            }
-                        }
-                    }
-                }
                 ShuffleMode::PairSwap => {
                     let mut i = 0;
                     while i + 1 < seq.len() {
@@ -402,8 +387,6 @@ impl SlicerState {
                     }
                 }
                 ShuffleMode::BlockReorder => {
-                    // Bloc 4 à intensité faible (préserve les patterns 4-on-the-floor),
-                    // bloc 2 à intensité haute (plus chaotique).
                     let block_size = if si < 0.5 { 4 } else { 2 };
                     let num_blocks = seq.len() / block_size;
                     if num_blocks >= 2 {
@@ -424,8 +407,6 @@ impl SlicerState {
                     }
                 }
             }
-            // Réajuste les durées après shuffle (chaque step joue sa slice
-            // à sa durée native).
             for step in seq.iter_mut() {
                 step.duration_frames = durations.get(step.slice_idx).copied().unwrap_or(0);
             }
@@ -448,13 +429,18 @@ impl SlicerState {
         }
 
         // === Étage 3 : Stutter (subdivisions) ===
+        // Le slider = probabilité qu'une slice soit stutterée. Le nombre de
+        // retriggers K est tiré aléatoirement dans des valeurs **musicales**
+        // : multiples de 2 (2/4/8/16) + triolets (3/6/12). Pas de K=5/7
+        // (découpes non-musicales). La rapidité est donc aléatoire mais
+        // toujours en grille rythmique.
+        const K_CHOICES: &[usize] = &[2, 3, 4, 6, 8, 12, 16];
         let ti = self.stutter_intensity.clamp(0.0, 1.0);
         if ti > 0.0 {
             let mut new_seq: Vec<RemixStep> = Vec::with_capacity(seq.len() * 2);
             for step in &seq {
                 if rng.gen::<f32>() < ti {
-                    let k_max = (2.0 + ti * 6.0).round() as usize;
-                    let k = rng.gen_range(2..=k_max.max(2));
+                    let k = K_CHOICES[rng.gen_range(0..K_CHOICES.len())];
                     let sub = step.duration_frames / k;
                     if sub > 0 {
                         for _ in 0..k {
@@ -523,6 +509,47 @@ impl SlicerState {
             }
         }
         out
+    }
+
+    /// Pendant la lecture remix, renvoie `(step_idx, slice_idx, sample_offset)`
+    /// pour le step en cours :
+    ///   - `step_idx` : index dans `remix_sequence`
+    ///   - `slice_idx` : index dans `onsets` de la slice jouée
+    ///   - `sample_offset` : offset en frames depuis le début de la slice
+    ///     (clamp à la durée native de la slice)
+    /// Sert à dessiner la playhead sur la waveform originale + highlight de
+    /// la slice en cours dans le bandeau de cells.
+    pub fn remix_current_play_info(&self) -> Option<(usize, usize, usize)> {
+        if !self.playing_remix { return None; }
+        let pb = self.playback.as_ref()?;
+        let audio = self.audio.as_ref()?;
+        let total = audio.mono.len();
+        if self.remix_sequence.is_empty() || total == 0 { return None; }
+        // Calcule play_frames effectif par step (= min(duration, durée native)).
+        let mut play_frames: Vec<usize> = Vec::with_capacity(self.remix_sequence.len());
+        let mut total_buf: usize = 0;
+        for step in &self.remix_sequence {
+            let pf = if step.slice_idx < self.onsets.len() {
+                let s = self.onsets[step.slice_idx];
+                let e = self.onsets.get(step.slice_idx + 1).copied()
+                    .unwrap_or(total).min(total);
+                step.duration_frames.min(e.saturating_sub(s))
+            } else { 0 };
+            play_frames.push(pf);
+            total_buf += pf;
+        }
+        if total_buf == 0 { return None; }
+        let played = (pb.position_fraction() * total_buf as f32) as usize;
+        let mut acc = 0usize;
+        for (i, &pf) in play_frames.iter().enumerate() {
+            if played < acc + pf {
+                let offset = played - acc;
+                let slice_idx = self.remix_sequence[i].slice_idx;
+                return Some((i, slice_idx, offset));
+            }
+            acc += pf;
+        }
+        None
     }
 
     /// Toggle Play/Stop pour la preview du remix. Lit en boucle pour
@@ -607,7 +634,6 @@ impl SlicerState {
         let t = (self.stutter_intensity.clamp(0.0, 1.0) * 100.0).round() as u32;
         let mode_tag = match self.shuffle_mode {
             ShuffleMode::Random => "rnd",
-            ShuffleMode::BeatAligned => "beat",
             ShuffleMode::PairSwap => "pair",
             ShuffleMode::BlockReorder => "blk",
         };
@@ -617,6 +643,39 @@ impl SlicerState {
         std::fs::write(&path, &bytes).map_err(|e| format!("write: {e}"))?;
         self.last_remix_midi_path = Some(path.clone());
         Ok(path)
+    }
+
+    /// Découpe **uniforme** : remplace les onsets par `n_beats × slices_per_beat`
+    /// positions équidistantes (au lieu de la détection de transients). Utile
+    /// pour des loops déjà en grille rythmique stricte (electro, techno).
+    pub fn slice_by_beats(&mut self) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let total = audio.mono.len() as u64;
+        if total == 0 { return; }
+        let n_beats = self.n_beats.max(1) as u64;
+        let spb = self.slices_per_beat.max(1) as u64;
+        let n = (n_beats * spb) as usize;
+        self.onsets = (0..n)
+            .map(|i| (i as u64 * total / n as u64) as usize)
+            .collect();
+        self.marked = vec![false; self.onsets.len()];
+        self.selected = vec![false; self.onsets.len()];
+        self.peaks_cache = None;
+        self.dragging_onset = None;
+        self.current_onset = None;
+        self.previewing_slice = None;
+        self.regenerate_remix();
+    }
+
+    /// Reset les paramètres du remix : intensités à 0, mode Random, séquence
+    /// régénérée (= identité). Préserve `remix_seed` (le bouton ↻ sert à
+    /// changer le seed).
+    pub fn reset_remix_params(&mut self) {
+        self.shuffle_intensity = 0.0;
+        self.repeat_intensity = 0.0;
+        self.stutter_intensity = 0.0;
+        self.shuffle_mode = ShuffleMode::Random;
+        self.regenerate_remix();
     }
 
     /// Relance la détection d'onsets sur le buffer courant (post-Delete
@@ -1232,7 +1291,10 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
     let has_audio = state.audio.is_some();
     let has_slices = !state.onsets.is_empty();
     let enabled = has_audio && has_slices;
-    ui.horizontal(|ui| {
+    // `horizontal_wrapped` autorise le retour à la ligne quand l'espace
+    // horizontal manque (labels "Shuffle/Repeat/Stutter" en entier + autres
+    // contrôles peuvent dépasser la largeur sur fenêtre étroite).
+    ui.horizontal_wrapped(|ui| {
         ui.add_enabled_ui(enabled, |ui| {
             ui.label(egui::RichText::new("Remix").color(palette::FG_DIM).strong());
             // Play/Stop
@@ -1247,10 +1309,12 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
             }
             let mut changed = false;
 
-            // Mode shuffle (ComboBox compact)
+            // === Groupe Shuffle === (label + mode + slider)
+            ui.separator();
+            ui.label(egui::RichText::new("Shuffle")
+                .color(palette::ACCENT_GREEN).strong());
             let mode_label = match state.shuffle_mode {
                 ShuffleMode::Random => "Random",
-                ShuffleMode::BeatAligned => "Beat-aligned",
                 ShuffleMode::PairSwap => "Pair-swap",
                 ShuffleMode::BlockReorder => "Block-reorder",
             };
@@ -1260,7 +1324,6 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
                 .show_ui(ui, |ui| {
                     for (m, l) in [
                         (ShuffleMode::Random, "Random"),
-                        (ShuffleMode::BeatAligned, "Beat-aligned"),
                         (ShuffleMode::PairSwap, "Pair-swap"),
                         (ShuffleMode::BlockReorder, "Block-reorder"),
                     ] {
@@ -1272,34 +1335,52 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
                         }
                     }
                 });
-
-            // 3 sliders compacts : Shuffle / Repeat / Stutter
             let r1 = ui.add(
                 egui::Slider::new(&mut state.shuffle_intensity, 0.0..=1.0)
-                    .show_value(true).fixed_decimals(2).text("Sh")
+                    .show_value(true).fixed_decimals(2)
             );
+
+            // === Groupe Repeat ===
+            ui.separator();
+            ui.label(egui::RichText::new("Repeat")
+                .color(palette::ACCENT_GREEN).strong());
             let r2 = ui.add(
                 egui::Slider::new(&mut state.repeat_intensity, 0.0..=1.0)
-                    .show_value(true).fixed_decimals(2).text("Rp")
+                    .show_value(true).fixed_decimals(2)
             );
+
+            // === Groupe Stutter ===
+            ui.separator();
+            ui.label(egui::RichText::new("Stutter")
+                .color(palette::ACCENT_GREEN).strong());
             let r3 = ui.add(
                 egui::Slider::new(&mut state.stutter_intensity, 0.0..=1.0)
-                    .show_value(true).fixed_decimals(2).text("St")
+                    .show_value(true).fixed_decimals(2)
             );
+            ui.separator();
+
             if r1.changed() || r2.changed() || r3.changed() { changed = true; }
 
             if ui.button("↻").on_hover_text("Regenerate (new seed)").clicked() {
                 state.remix_seed = state.remix_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
                 changed = true;
             }
+            // Reset des paramètres : intensités à 0 + mode Random. Préserve
+            // le seed (utiliser ↻ pour le changer).
+            if ui.button("Reset")
+                .on_hover_text("Reset intensités + mode → identité")
+                .clicked()
+            {
+                state.reset_remix_params();
+            }
             if changed {
                 state.regenerate_remix();
             }
-        });
 
-        // Drag MIDI à droite (flush right) — drag-out OLE comme le bouton
-        // MIDI standard.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Drag MIDI inline (avant on était en `with_layout(right_to_left)`
+            // pour flush right, mais ça ne fonctionne plus dans un
+            // `horizontal_wrapped`). Reste sur la même ligne que les autres
+            // contrôles, ou wrap si pas la place.
             #[cfg(windows)]
             {
                 let drag_resp = drag_remix_midi_button(ui, enabled, REMIX_CONTROLS_H);
@@ -1468,6 +1549,9 @@ fn paint_cells(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
     let view = state.view;
     if view.len() == 0 { return; }
 
+    // Index du slice en cours de lecture dans le remix (pour highlight).
+    let remix_current_slice = state.remix_current_play_info().map(|(_, s, _)| s);
+
     // Cellules visibles uniquement (clamp slice extent à la fenêtre).
     for (i, &start) in state.onsets.iter().enumerate() {
         let end = state.onsets.get(i + 1).copied().unwrap_or(total);
@@ -1487,6 +1571,7 @@ fn paint_cells(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
         let selected = state.selected.get(i).copied().unwrap_or(false);
         let marked = state.marked.get(i).copied().unwrap_or(false);
         let previewing = state.previewing_slice == Some(i);
+        let remix_playing_here = remix_current_slice == Some(i);
         let fill = if selected {
             palette::ACCENT_GREEN  // à garder pour export
         } else if marked {
@@ -1495,8 +1580,9 @@ fn paint_cells(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
             palette::BG_PANEL
         };
         painter.rect_filled(cell, 1.5, fill);
-        // Surbrillance jaune épaisse autour de la slice en cours de preview.
-        if previewing {
+        // Surbrillance jaune épaisse autour de la slice en cours de preview
+        // OU de la slice actuellement jouée par le remix.
+        if previewing || remix_playing_here {
             painter.rect_stroke(
                 cell,
                 1.5,
@@ -1706,20 +1792,32 @@ fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
         }
     }
 
-    // Playhead (Loop full audio uniquement). En preview de slice on ne
-    // dessine PAS la playhead — la position serait dans le buffer de la
-    // slice extraite, pas du buffer global. À la place, la cellule est
-    // highlight (cf. paint_cells).
+    // Playhead. 3 cas :
+    //   - Preview de slice → pas de playhead (la position serait dans le
+    //     buffer extrait, pas dans le buffer global). La cellule est highlight.
+    //   - Lecture remix → on convertit la position dans le buffer rendu vers
+    //     la position dans la WAVEFORM ORIGINALE via `remix_current_play_info`.
+    //     La playhead suit donc la slice actuellement jouée.
+    //   - Loop full audio → playhead linéaire dans le buffer.
     if state.previewing_slice.is_none() {
         if let Some(pb) = &state.playback {
             if let Some(audio) = &state.audio {
                 let total = audio.mono.len();
-                let pos_sample = (pb.position_fraction() * total as f32) as usize;
-                if let Some(x) = view.sample_to_x(pos_sample, rect) {
-                    painter.line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(2.0, palette::ACCENT_ORANGE),
-                    );
+                let pos_sample = if state.playing_remix {
+                    state.remix_current_play_info()
+                        .and_then(|(_, slice_idx, offset)| {
+                            state.onsets.get(slice_idx).map(|&s| (s + offset).min(total.saturating_sub(1)))
+                        })
+                } else {
+                    Some((pb.position_fraction() * total as f32) as usize)
+                };
+                if let Some(pos) = pos_sample {
+                    if let Some(x) = view.sample_to_x(pos, rect) {
+                        painter.line_segment(
+                            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                            egui::Stroke::new(2.0, palette::ACCENT_ORANGE),
+                        );
+                    }
                 }
             }
         }
@@ -1764,6 +1862,31 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
             if resp.changed() {
                 state.redetect();
             }
+
+            ui.separator();
+
+            // Beat slice : génère onsets uniformément (n_beats × slices_per_beat).
+            // Utile quand la loop est déjà en grille rythmique stricte.
+            ui.add_enabled_ui(has_audio, |ui| {
+                if state.slices_per_beat == 0 { state.slices_per_beat = 4; }
+                egui::ComboBox::from_id_source("slices_per_beat")
+                    .selected_text(format!("{}/beat", state.slices_per_beat))
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for &spb in &[1u32, 2, 3, 4, 6, 8, 16] {
+                            ui.selectable_value(
+                                &mut state.slices_per_beat, spb,
+                                format!("{spb}/beat"),
+                            );
+                        }
+                    });
+                if ui.button("Beat slice")
+                    .on_hover_text("Découpe uniforme : n_beats × subdivision onsets équidistants")
+                    .clicked()
+                {
+                    state.slice_by_beats();
+                }
+            });
         });
     });
 

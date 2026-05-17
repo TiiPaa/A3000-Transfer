@@ -517,6 +517,16 @@ impl A3000App {
         }
     }
 
+    /// Upload → Slicer : charge le WAV dans le Slicer et bascule sur le tab.
+    fn poll_upload_send_to_slicer(&mut self) {
+        let Some(path) = self.upload.request_send_to_slicer.take() else { return; };
+        let name = path.file_name()
+            .and_then(|s| s.to_str()).unwrap_or("?").to_string();
+        self.slicer.load(path);
+        self.active_tab = Tab::Slicer;
+        self.status = format!("« {name} » chargé dans le Slicer");
+    }
+
     /// Modal Settings : édite HA/BUS/TARGET/LUN + auto/manual start slot.
     /// Pas de Save/Cancel ; les changements sont live et persistés au save()
     /// d'eframe. Bouton Close ferme la fenêtre.
@@ -594,6 +604,7 @@ impl eframe::App for A3000App {
         self.poll_upload_request();
         self.poll_download_request();
         self.poll_slicer_send_to_upload();
+        self.poll_upload_send_to_slicer();
 
         // Si on est en train de se connecter, on repaint régulièrement pour
         // récupérer la transition.

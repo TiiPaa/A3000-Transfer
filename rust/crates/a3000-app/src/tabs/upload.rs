@@ -48,6 +48,9 @@ pub struct UploadState {
     playback: Option<Playback>,
     /// Index de l'item en cours de preview (None si rien en lecture).
     playing_idx: Option<usize>,
+    /// Demande de send vers le Slicer : path WAV à charger. L'app draine et
+    /// reset à None après load + switch de tab.
+    pub request_send_to_slicer: Option<PathBuf>,
 }
 
 pub struct UploadItem {
@@ -432,6 +435,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
         let playing_idx = state.playing_idx;
         let mut to_remove: Option<usize> = None;
         let mut to_play: Option<usize> = None;
+        let mut to_send_slicer: Option<usize> = None;
         for (idx, item) in state.items.iter_mut().enumerate() {
             let row_color = if playing_idx == Some(idx) {
                 palette::ACCENT_YELLOW  // surbrillance preview
@@ -459,7 +463,7 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                 // signaler que c'est interactif (convention web).
                 cell(ui, COL_FILE, |ui| {
                     let is_playing_this = playing_idx == Some(idx);
-                    let tip = if is_playing_this { "Stop preview" } else { "Play preview" };
+                    let tip = if is_playing_this { "Stop preview" } else { "Play preview (right-click for menu)" };
                     let resp = ui.add(
                         egui::Label::new(egui::RichText::new(file_name).color(row_color))
                             .sense(egui::Sense::click()),
@@ -470,6 +474,17 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                     if resp.clicked() {
                         to_play = Some(idx);
                     }
+                    // Click droit → menu contextuel
+                    resp.context_menu(|ui| {
+                        if ui.button("Send to Slicer").clicked() {
+                            to_send_slicer = Some(idx);
+                            ui.close_menu();
+                        }
+                        if ui.button("Remove").clicked() {
+                            to_remove = Some(idx);
+                            ui.close_menu();
+                        }
+                    });
                 });
 
                 cell(ui, COL_NAME, |ui| {
@@ -505,7 +520,42 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
                     paint_progress_bar(ui, item.progress, COL_PROGRESS - 10.0, 14.0);
                 });
                 cell(ui, COL_ACTION, |ui| {
-                    if ui.small_button("×").on_hover_text("Remove").clicked() {
+                    // Bouton peint manuellement, **centré** dans la cell.
+                    // Sans painter direct, le Layout::left_to_right d'egui
+                    // colle le bouton au bord gauche de la cell et son focus
+                    // stroke (qui dépasse de 1-2 px) est coupé par le
+                    // clip_rect strict du cell → truncation visible "à gauche".
+                    // Ici on calcule le rect exactement centré et on dessine
+                    // frame + glyph soi-même : aucun débordement possible.
+                    let cell_rect = ui.max_rect();
+                    let btn_size = egui::vec2(17.0, 17.0);
+                    let btn_rect = egui::Rect::from_center_size(
+                        cell_rect.center(), btn_size,
+                    );
+                    let id = ui.id().with(("upload_x", idx));
+                    let resp = ui.interact(btn_rect, id, egui::Sense::click())
+                        .on_hover_text("Remove");
+                    let visuals = ui.style().interact(&resp);
+                    // Frame discret : weak_bg_fill au repos, plus marqué au hover.
+                    ui.painter().rect(
+                        btn_rect, 3.0, visuals.weak_bg_fill, visuals.bg_stroke,
+                    );
+                    let glyph_color = if resp.hovered() {
+                        palette::ACCENT_RED
+                    } else {
+                        palette::FG_DIM
+                    };
+                    ui.painter().text(
+                        btn_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        egui::FontId::proportional(14.0),
+                        glyph_color,
+                    );
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
                         to_remove = Some(idx);
                     }
                 });
@@ -526,6 +576,11 @@ fn show_table(ui: &mut egui::Ui, state: &mut UploadState) {
         }
         if let Some(i) = to_play {
             state.toggle_play(i);
+        }
+        if let Some(i) = to_send_slicer {
+            if let Some(item) = state.items.get(i) {
+                state.request_send_to_slicer = Some(item.path.clone());
+            }
         }
     });
 }
