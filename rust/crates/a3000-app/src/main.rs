@@ -18,6 +18,7 @@ mod config;
 mod ipc;
 mod tabs;
 mod theme;
+mod time_stretch;
 
 #[cfg(windows)]
 mod client;

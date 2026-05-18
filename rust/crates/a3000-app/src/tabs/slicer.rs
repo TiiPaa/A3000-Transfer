@@ -86,14 +86,36 @@ pub struct SlicerState {
     previewing_slice: Option<usize>,
     /// Fenêtre visible sur la waveform (zoom + pan). [start, end) en samples.
     view: ViewWindow,
+    /// Plage sélectionnée par Shift+drag sur la waveform : `(start, end)` en
+    /// samples avec `start <= end`. Sert au Crop et au Loop-selection.
+    pub selection: Option<(usize, usize)>,
+    /// État interne pendant un Shift+drag : sample où le drag a commencé.
+    selection_drag_start: Option<usize>,
+    /// État interne pendant un drag d'extrémité de la sélection.
+    selection_drag_edge: Option<SelectionEdge>,
+    /// Pile d'undo : snapshots audio + onsets avant chaque opération
+    /// destructive (delete_marked / crop / redetect / slice_by_beats /
+    /// add_onset / delete_onset). Limité à 20 entrées pour éviter le bloat
+    /// mémoire (~2 MB par snapshot pour des loops typiques).
+    undo_stack: Vec<UndoSnapshot>,
+    /// Mode d'algorithme pour le time-stretch (Warp). Linear par défaut
+    /// (rapide, légère altération pitch) ; WSOLA pour préserver le pitch.
+    pub stretch_mode: StretchMode,
+    /// État du drag de warp (Alt+drag sur un onset). Capturé au press,
+    /// consommé au release. `None` en dehors d'un Alt+drag.
+    warp_drag: Option<WarpDragState>,
     /// === Remix === Pipeline 3 étages, chacun avec son intensité [0, 1].
     /// Ordre d'application : Shuffle → Repeat → Stutter.
     pub shuffle_mode: ShuffleMode,
     pub shuffle_intensity: f32,
     pub repeat_intensity: f32,
     pub stutter_intensity: f32,
-    /// Graine du PRNG. Bumpée par le bouton "Regenerate".
-    pub remix_seed: u64,
+    /// Graines PRNG indépendantes par étage : chaque ↻ par section bump
+    /// uniquement le seed concerné → re-roll d'un seul algo sans toucher
+    /// aux autres. Le ↻ global bump les 3.
+    pub shuffle_seed: u64,
+    pub repeat_seed: u64,
+    pub stutter_seed: u64,
     /// Séquence courante après pipeline. Somme des durées = durée totale du
     /// remix (peut différer de la loop d'origine si Repeat change le mapping).
     pub remix_sequence: Vec<RemixStep>,
@@ -127,12 +149,80 @@ pub struct RemixStep {
     pub duration_frames: usize,
 }
 
+/// Snapshot pour l'undo : capture l'état audio + onsets + sélections AVANT
+/// une opération destructive. Le remix sera régénéré au restore (pas de
+/// snapshot des params remix, qui sont peu coûteux à régénérer).
+#[derive(Clone)]
+struct UndoSnapshot {
+    audio: AudioData,
+    onsets: Vec<usize>,
+    marked: Vec<bool>,
+    selected: Vec<bool>,
+}
+
+const UNDO_LIMIT: usize = 20;
+
+impl Clone for AudioData {
+    fn clone(&self) -> Self {
+        AudioData {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            mono: self.mono.clone(),
+            pcm16_le: self.pcm16_le.clone(),
+            duration_s: self.duration_s,
+        }
+    }
+}
+
 /// Distinguer un drag click-gauche (selected) d'un drag click-droit (marked).
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum DragKind {
     #[default]
     Selected,
     Marked,
+}
+
+/// Extrémité d'une sélection en cours de drag (resize).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SelectionEdge { Left, Right }
+
+/// Algorithme utilisé pour la fonction Warp (time-stretch à l'Alt+drag d'onset).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StretchMode {
+    /// Resampling linéaire — rapide, simple, pitch change avec stretch.
+    /// Inaudible < 5% de stretch, sonne pitched au-delà.
+    #[default]
+    Linear,
+    /// WSOLA — préserve le pitch. ~10× plus lent que Linear mais qualité
+    /// production jusqu'à ±50% de stretch.
+    Wsola,
+}
+
+/// Snapshot capturé au début d'un Alt+drag d'onset (Warp).
+/// On garde l'audio original des 2 slices voisines pour pouvoir recalculer
+/// le time-stretch depuis la source au release (et non depuis un buffer
+/// déjà altéré par d'éventuels stretches successifs pendant le drag).
+struct WarpDragState {
+    /// Index de l'onset draggué dans `state.onsets`.
+    onset_idx: usize,
+    /// Sample du voisin gauche au press (fixe pendant le drag).
+    left_anchor: usize,
+    /// Sample du voisin droit au press (fixe pendant le drag).
+    right_anchor: usize,
+    /// Durée originale de la slice gauche (= position de l'onset au press
+    /// moins `left_anchor`).
+    orig_left_dur: usize,
+    /// Durée originale de la slice droite (= `right_anchor` moins
+    /// position de l'onset au press).
+    #[allow(dead_code)]
+    orig_right_dur: usize,
+    /// Audio mono original entre `left_anchor` et `right_anchor`.
+    /// Utilisé pour la régénération du peaks_cache (et debug).
+    #[allow(dead_code)]
+    orig_mono: Vec<f32>,
+    /// Audio PCM16-LE interleaved original entre `left_anchor` et
+    /// `right_anchor`. Source de vérité pour le stretch (préserve la stéréo).
+    orig_pcm16_le: Vec<u8>,
 }
 
 /// Fenêtre visible : intervalle [start, end) de samples du buffer audio.
@@ -198,6 +288,11 @@ impl SlicerState {
         self.current_onset = None;
         self.playback = None;
         self.previewing_slice = None;
+        self.selection = None;
+        self.selection_drag_start = None;
+        self.selection_drag_edge = None;
+        self.warp_drag = None;
+        self.undo_stack.clear();
         self.view = ViewWindow::default();
         match load_wave(&path) {
             Ok(payload) => {
@@ -226,7 +321,9 @@ impl SlicerState {
                 if self.n_beats == 0 {
                     self.n_beats = 16;
                 }
-                if self.remix_seed == 0 { self.remix_seed = 0xA3000; }
+                if self.shuffle_seed == 0 { self.shuffle_seed = 0xA3000_5111; }
+                if self.repeat_seed == 0 { self.repeat_seed = 0xA3000_5222; }
+                if self.stutter_seed == 0 { self.stutter_seed = 0xA3000_5333; }
                 if self.slices_per_beat == 0 { self.slices_per_beat = 4; }
                 self.regenerate_remix();
             }
@@ -274,10 +371,12 @@ impl SlicerState {
     /// `marked` étant invalidés, on reset tout à false. Reset le cache de
     /// peaks et l'éventuel onset en cours de drag.
     pub fn delete_marked(&mut self) {
-        let Some(audio) = self.audio.as_mut() else { return; };
+        if self.audio.is_none() { return; }
         if self.marked.iter().all(|&m| !m) {
             return;
         }
+        self.push_undo();
+        let audio = self.audio.as_mut().unwrap();
         let total = audio.mono.len();
         let bytes_per_frame = usize::from(audio.channels.max(1)) * 2;
         let mut new_audio: Vec<f32> = Vec::with_capacity(total);
@@ -359,20 +458,25 @@ impl SlicerState {
             let e = self.onsets.get(i + 1).copied().unwrap_or(total).min(total);
             e.saturating_sub(s)
         }).collect();
-        let mut rng = ChaCha8Rng::seed_from_u64(self.remix_seed);
+        // 3 RNGs indépendants : chaque étage du pipeline a son propre flux
+        // d'aléa, seedé par son seed dédié. Re-rouler un seul étage (via ↻
+        // par section) ne change pas les autres.
+        let mut shuffle_rng = ChaCha8Rng::seed_from_u64(self.shuffle_seed);
+        let mut repeat_rng = ChaCha8Rng::seed_from_u64(self.repeat_seed);
+        let mut stutter_rng = ChaCha8Rng::seed_from_u64(self.stutter_seed);
         let mut seq: Vec<RemixStep> = (0..n).map(|i| RemixStep {
             slice_idx: i,
             duration_frames: durations[i],
         }).collect();
 
-        // === Étage 1 : Shuffle ===
+        // === Étage 1 : Shuffle === (utilise shuffle_rng)
         let si = self.shuffle_intensity.clamp(0.0, 1.0);
         if si > 0.0 {
             match self.shuffle_mode {
                 ShuffleMode::Random => {
                     for i in 0..seq.len() {
-                        if rng.gen::<f32>() < si {
-                            let j = rng.gen_range(0..seq.len());
+                        if shuffle_rng.gen::<f32>() < si {
+                            let j = shuffle_rng.gen_range(0..seq.len());
                             seq.swap(i, j);
                         }
                     }
@@ -380,7 +484,7 @@ impl SlicerState {
                 ShuffleMode::PairSwap => {
                     let mut i = 0;
                     while i + 1 < seq.len() {
-                        if rng.gen::<f32>() < si {
+                        if shuffle_rng.gen::<f32>() < si {
                             seq.swap(i, i + 1);
                         }
                         i += 2;
@@ -393,8 +497,8 @@ impl SlicerState {
                         let original = seq.clone();
                         let mut order: Vec<usize> = (0..num_blocks).collect();
                         for i in 0..num_blocks {
-                            if rng.gen::<f32>() < si {
-                                let j = rng.gen_range(0..num_blocks);
+                            if shuffle_rng.gen::<f32>() < si {
+                                let j = shuffle_rng.gen_range(0..num_blocks);
                                 order.swap(i, j);
                             }
                         }
@@ -412,15 +516,15 @@ impl SlicerState {
             }
         }
 
-        // === Étage 2 : Repeat (beat-repeat) ===
+        // === Étage 2 : Repeat (beat-repeat) === (utilise repeat_rng)
         let ri = self.repeat_intensity.clamp(0.0, 1.0);
         if ri > 0.0 {
             for i in 1..seq.len() {
-                if rng.gen::<f32>() < ri {
-                    let source = if rng.gen::<bool>() {
+                if repeat_rng.gen::<f32>() < ri {
+                    let source = if repeat_rng.gen::<bool>() {
                         seq[i - 1].slice_idx
                     } else {
-                        rng.gen_range(0..i)
+                        repeat_rng.gen_range(0..i)
                     };
                     seq[i].slice_idx = source;
                     seq[i].duration_frames = durations.get(source).copied().unwrap_or(0);
@@ -428,7 +532,7 @@ impl SlicerState {
             }
         }
 
-        // === Étage 3 : Stutter (subdivisions) ===
+        // === Étage 3 : Stutter (subdivisions) === (utilise stutter_rng)
         // Le slider = probabilité qu'une slice soit stutterée. Le nombre de
         // retriggers K est tiré aléatoirement dans des valeurs **musicales**
         // : multiples de 2 (2/4/8/16) + triolets (3/6/12). Pas de K=5/7
@@ -439,8 +543,8 @@ impl SlicerState {
         if ti > 0.0 {
             let mut new_seq: Vec<RemixStep> = Vec::with_capacity(seq.len() * 2);
             for step in &seq {
-                if rng.gen::<f32>() < ti {
-                    let k = K_CHOICES[rng.gen_range(0..K_CHOICES.len())];
+                if stutter_rng.gen::<f32>() < ti {
+                    let k = K_CHOICES[stutter_rng.gen_range(0..K_CHOICES.len())];
                     let sub = step.duration_frames / k;
                     if sub > 0 {
                         for _ in 0..k {
@@ -645,6 +749,301 @@ impl SlicerState {
         Ok(path)
     }
 
+    /// Push un snapshot avant une opération destructive. Limite la pile à
+    /// `UNDO_LIMIT` (drop les plus anciens). Appelé AVANT la mutation.
+    fn push_undo(&mut self) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let snap = UndoSnapshot {
+            audio: audio.clone(),
+            onsets: self.onsets.clone(),
+            marked: self.marked.clone(),
+            selected: self.selected.clone(),
+        };
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(snap);
+    }
+
+    /// Restore l'état précédent. Reset les drag/preview/playback transients
+    /// pour cohérence. Régénère le remix sur les nouveaux onsets.
+    pub fn undo(&mut self) {
+        let Some(snap) = self.undo_stack.pop() else { return; };
+        self.audio = Some(snap.audio);
+        self.onsets = snap.onsets;
+        self.marked = snap.marked;
+        self.selected = snap.selected;
+        self.peaks_cache = None;
+        self.dragging_onset = None;
+        self.current_onset = None;
+        self.previewing_slice = None;
+        self.playback = None;
+        self.playing_remix = false;
+        self.selection = None;
+        self.selection_drag_start = None;
+        self.selection_drag_edge = None;
+        self.warp_drag = None;
+        // Resize view sur le nouveau buffer.
+        if let Some(audio) = self.audio.as_ref() {
+            self.view = ViewWindow { start: 0, end: audio.mono.len() };
+        }
+        self.regenerate_remix();
+    }
+
+    pub fn can_undo(&self) -> bool { !self.undo_stack.is_empty() }
+
+    /// Crop l'audio à la `selection` : tronque mono + pcm16_le à
+    /// `[selection.0, selection.1)`, filtre les onsets dans la plage et
+    /// les translate de `-selection.0`, clear la selection, reset view.
+    /// No-op si aucune selection ou range invalide.
+    pub fn crop_to_selection(&mut self) {
+        let Some((sel_start, sel_end)) = self.selection else { return; };
+        // Validation rapide en immutable borrow scope.
+        let (total, channels, sample_rate) = match &self.audio {
+            Some(a) => (a.mono.len(), a.channels, a.sample_rate),
+            None => return,
+        };
+        let sel_start = sel_start.min(total);
+        let sel_end = sel_end.min(total);
+        if sel_end <= sel_start { return; }
+        self.push_undo();
+        // Re-borrow après push_undo (qui prend &mut self) pour construire le
+        // nouveau buffer.
+        let audio = self.audio.as_ref().unwrap();
+        let bytes_per_frame = usize::from(channels.max(1)) * 2;
+        let b0 = sel_start * bytes_per_frame;
+        let b1 = (sel_end * bytes_per_frame).min(audio.pcm16_le.len());
+        let new_mono = audio.mono[sel_start..sel_end].to_vec();
+        let new_pcm = audio.pcm16_le[b0..b1].to_vec();
+        let new_len = new_mono.len();
+        let new_audio = AudioData {
+            sample_rate,
+            channels,
+            mono: new_mono,
+            pcm16_le: new_pcm,
+            duration_s: new_len as f64 / sample_rate.max(1) as f64,
+        };
+        // Onsets : on garde ceux dans [sel_start, sel_end), on shift de -sel_start.
+        // On ajoute un onset 0 si pas déjà présent (sinon la première slice ne
+        // commence pas à 0).
+        let mut new_onsets: Vec<usize> = self.onsets.iter()
+            .filter(|&&o| o >= sel_start && o < sel_end)
+            .map(|&o| o - sel_start)
+            .collect();
+        if !matches!(new_onsets.first(), Some(&0)) {
+            new_onsets.insert(0, 0);
+        }
+        self.audio = Some(new_audio);
+        self.onsets = new_onsets;
+        self.marked = vec![false; self.onsets.len()];
+        self.selected = vec![false; self.onsets.len()];
+        self.peaks_cache = None;
+        self.dragging_onset = None;
+        self.current_onset = None;
+        self.previewing_slice = None;
+        self.playback = None;
+        self.playing_remix = false;
+        self.selection = None;
+        self.selection_drag_start = None;
+        self.view = ViewWindow { start: 0, end: new_len };
+        self.regenerate_remix();
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_drag_start = None;
+        self.selection_drag_edge = None;
+        // Si on jouait la sélection en boucle, restart sur le buffer complet.
+        if self.playback.is_some() && !self.playing_remix && self.previewing_slice.is_none() {
+            self.restart_loop_with_current_selection();
+        }
+    }
+
+    /// Stop le stream cpal courant et redémarre un Loop sur la sélection
+    /// courante (ou le buffer complet si pas de sélection). Utilisé quand
+    /// l'utilisateur redimensionne / change la sélection pendant la lecture
+    /// → permet d'entendre immédiatement la nouvelle zone.
+    pub fn restart_loop_with_current_selection(&mut self) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let bpf = usize::from(audio.channels.max(1)) * 2;
+        let (b0, b1) = if let Some((s, e)) = self.selection {
+            let total = audio.mono.len();
+            let s = s.min(total);
+            let e = e.min(total);
+            if e > s {
+                (s * bpf, (e * bpf).min(audio.pcm16_le.len()))
+            } else {
+                (0, audio.pcm16_le.len())
+            }
+        } else {
+            (0, audio.pcm16_le.len())
+        };
+        let sr = audio.sample_rate;
+        let ch = audio.channels;
+        let interleaved = crate::audio::pcm16_le_bytes_to_interleaved_f32(
+            &audio.pcm16_le[b0..b1],
+        );
+        self.playback = None;
+        match Playback::start_loop(interleaved, sr, ch) {
+            Ok(p) => { self.playback = Some(p); }
+            Err(e) => self.error = Some(format!("× restart playback : {e}")),
+        }
+    }
+
+    /// Initie un Alt+drag de warp sur l'onset `idx`. Capture le snapshot
+    /// de l'audio entre les 2 onsets voisins pour pouvoir time-stretcher
+    /// au release depuis la source originale (non altérée par d'éventuelles
+    /// frames intermédiaires). Push un undo aussi.
+    /// No-op si `idx == 0` (pas de slice gauche) ou pas d'audio.
+    pub fn start_warp_drag(&mut self, idx: usize) {
+        if idx == 0 { return; }
+        let (total, channels) = match &self.audio {
+            Some(a) => (a.mono.len(), a.channels.max(1)),
+            None => return,
+        };
+        if idx >= self.onsets.len() { return; }
+        let left_anchor = self.onsets[idx - 1];
+        let right_anchor = self.onsets.get(idx + 1).copied().unwrap_or(total).min(total);
+        let onset_at_press = self.onsets[idx];
+        if onset_at_press <= left_anchor || onset_at_press >= right_anchor { return; }
+        let orig_left_dur = onset_at_press - left_anchor;
+        let orig_right_dur = right_anchor - onset_at_press;
+        self.push_undo();
+        let audio = self.audio.as_ref().unwrap();
+        let bpf = usize::from(channels) * 2;
+        let b0 = left_anchor * bpf;
+        let b1 = (right_anchor * bpf).min(audio.pcm16_le.len());
+        let orig_mono = audio.mono[left_anchor..right_anchor].to_vec();
+        let orig_pcm16_le = audio.pcm16_le[b0..b1].to_vec();
+        self.warp_drag = Some(WarpDragState {
+            onset_idx: idx,
+            left_anchor,
+            right_anchor,
+            orig_left_dur,
+            orig_right_dur,
+            orig_mono,
+            orig_pcm16_le,
+        });
+    }
+
+    /// Commit du time-stretch : prend le `warp_drag` snapshot, calcule les
+    /// nouvelles durées des slices gauche/droite depuis la position courante
+    /// de l'onset, time-stretche les 2 morceaux originaux selon le
+    /// `stretch_mode`, splice dans `audio.mono` et `audio.pcm16_le`.
+    /// Régénère le remix (les durées de slice ont changé).
+    pub fn commit_warp_drag(&mut self) {
+        let Some(warp) = self.warp_drag.take() else { return; };
+        let (sample_rate, channels) = match &self.audio {
+            Some(a) => (a.sample_rate, a.channels.max(1) as usize),
+            None => return,
+        };
+        let idx = warp.onset_idx;
+        if idx >= self.onsets.len() { return; }
+        let new_onset = self.onsets[idx]
+            .clamp(warp.left_anchor + 1, warp.right_anchor.saturating_sub(1));
+        let new_left_dur = new_onset - warp.left_anchor;
+        let new_right_dur = warp.right_anchor - new_onset;
+
+        // Split du snapshot interleaved en moitié gauche / droite.
+        let bpf = channels * 2;
+        let left_bytes = warp.orig_left_dur * bpf;
+        let split = left_bytes.min(warp.orig_pcm16_le.len());
+        let orig_left_pcm = &warp.orig_pcm16_le[..split];
+        let orig_right_pcm = &warp.orig_pcm16_le[split..];
+        let orig_left_f32 = crate::audio::pcm16_le_bytes_to_interleaved_f32(orig_left_pcm);
+        let orig_right_f32 = crate::audio::pcm16_le_bytes_to_interleaved_f32(orig_right_pcm);
+
+        let stretched_left = self.run_stretch(
+            &orig_left_f32, channels, sample_rate, new_left_dur,
+        );
+        let stretched_right = self.run_stretch(
+            &orig_right_f32, channels, sample_rate, new_right_dur,
+        );
+
+        // Reconstruction des buffers cibles.
+        let mut new_mono: Vec<f32> = Vec::with_capacity(new_left_dur + new_right_dur);
+        let mut new_pcm: Vec<u8> = Vec::with_capacity((new_left_dur + new_right_dur) * bpf);
+        // Mono : moyenne des channels (utilisé pour viz/détection, pas pour audio).
+        let push_mono = |out: &mut Vec<f32>, interleaved: &[f32]| {
+            let frames = interleaved.len() / channels.max(1);
+            for f in 0..frames {
+                let mut sum = 0.0_f32;
+                for c in 0..channels {
+                    sum += interleaved[f * channels + c];
+                }
+                out.push(sum / channels as f32);
+            }
+        };
+        push_mono(&mut new_mono, &stretched_left);
+        push_mono(&mut new_mono, &stretched_right);
+        new_pcm.extend_from_slice(&crate::audio::interleaved_f32_to_pcm16_le(&stretched_left));
+        new_pcm.extend_from_slice(&crate::audio::interleaved_f32_to_pcm16_le(&stretched_right));
+
+        // Splice dans le buffer audio.
+        let audio = self.audio.as_mut().unwrap();
+        let b0 = warp.left_anchor * bpf;
+        let b1 = (warp.right_anchor * bpf).min(audio.pcm16_le.len());
+        audio.mono.splice(warp.left_anchor..warp.right_anchor, new_mono);
+        audio.pcm16_le.splice(b0..b1, new_pcm);
+        audio.duration_s = audio.mono.len() as f64 / audio.sample_rate.max(1) as f64;
+
+        // Onset courant déjà à `new_onset`. Pas d'autres onsets à shifter
+        // car les ancres restent fixes (total length entre ancres préservée
+        // si new_left_dur + new_right_dur == orig durée — ce qui est le cas
+        // par construction).
+        self.peaks_cache = None;
+        self.previewing_slice = None;
+        self.regenerate_remix();
+        // Si on était en train de jouer en loop (pas remix, pas preview de
+        // slice), restart pour entendre immédiatement le résultat du
+        // time-stretch. Le `regenerate_remix` plus haut gère déjà le cas
+        // où playing_remix est actif.
+        if self.playback.is_some() && !self.playing_remix && self.previewing_slice.is_none() {
+            self.restart_loop_with_current_selection();
+        }
+    }
+
+    /// Dispatch du time-stretch selon `stretch_mode`. Wrapper pour
+    /// `commit_warp_drag`. Préserve les channels.
+    fn run_stretch(
+        &self,
+        input: &[f32],
+        channels: usize,
+        sample_rate: u32,
+        target_frames: usize,
+    ) -> Vec<f32> {
+        match self.stretch_mode {
+            StretchMode::Linear =>
+                crate::time_stretch::stretch_linear(input, channels, target_frames),
+            StretchMode::Wsola =>
+                crate::time_stretch::stretch_wsola(input, channels, sample_rate, target_frames),
+        }
+    }
+
+    /// Étend la sélection courante avec la slice contenant `sample`. Si
+    /// aucune sélection n'existe, en crée une à la plage de la slice.
+    /// Mirror du UX "Ctrl+click pour ajouter une slice à la sélection".
+    pub fn extend_selection_with_slice_at(&mut self, sample: usize) {
+        let Some(audio) = self.audio.as_ref() else { return; };
+        let Some(idx) = self.slice_at_sample(sample) else { return; };
+        let total = audio.mono.len();
+        let slice_start = self.onsets[idx];
+        let slice_end = self.onsets.get(idx + 1).copied().unwrap_or(total).min(total);
+        if slice_end <= slice_start { return; }
+        let prev = self.selection;
+        self.selection = Some(match self.selection {
+            Some((s, e)) => (s.min(slice_start), e.max(slice_end)),
+            None => (slice_start, slice_end),
+        });
+        if self.selection != prev
+            && self.playback.is_some()
+            && !self.playing_remix
+            && self.previewing_slice.is_none()
+        {
+            self.restart_loop_with_current_selection();
+        }
+    }
+
     /// Découpe **uniforme** : remplace les onsets par `n_beats × slices_per_beat`
     /// positions équidistantes (au lieu de la détection de transients). Utile
     /// pour des loops déjà en grille rythmique stricte (electro, techno).
@@ -652,6 +1051,7 @@ impl SlicerState {
         let Some(audio) = self.audio.as_ref() else { return; };
         let total = audio.mono.len() as u64;
         if total == 0 { return; }
+        self.push_undo();
         let n_beats = self.n_beats.max(1) as u64;
         let spb = self.slices_per_beat.max(1) as u64;
         let n = (n_beats * spb) as usize;
@@ -682,7 +1082,9 @@ impl SlicerState {
     /// marked si applicable) avec la sensibilité courante. Efface les
     /// sélections/marquages utilisateur (les indices ne correspondent plus).
     pub fn redetect(&mut self) {
-        let Some(audio) = self.audio.as_ref() else { return; };
+        if self.audio.is_none() { return; }
+        self.push_undo();
+        let audio = self.audio.as_ref().unwrap();
         if self.sensitivity <= 0.0 { self.sensitivity = 1.0; }
         let opts = DetectOptions {
             sensitivity: self.sensitivity,
@@ -710,6 +1112,7 @@ impl SlicerState {
         if idx < self.onsets.len() && self.onsets[idx] == sample {
             return;
         }
+        self.push_undo();
         self.onsets.insert(idx, sample);
         // Nouvelle slice : par défaut ni selected ni marked (le 1er demi de la
         // slice parente conserve son état, le 2nd demi part vierge).
@@ -727,6 +1130,7 @@ impl SlicerState {
     /// `view.py::_delete_onset`.
     pub fn delete_onset(&mut self, idx: usize) {
         if idx == 0 || idx >= self.onsets.len() { return; }
+        self.push_undo();
         self.onsets.remove(idx);
         self.selected.remove(idx);
         self.marked.remove(idx);
@@ -907,6 +1311,8 @@ impl SlicerState {
 
     pub fn is_playing(&self) -> bool { self.playback.is_some() }
 
+    /// Toggle Play/Stop. Si une `selection` est active, joue uniquement la
+    /// plage sélectionnée en boucle. Sinon joue le buffer audio complet.
     pub fn toggle_playback(&mut self) {
         if self.playback.is_some() {
             self.playback = None;
@@ -915,11 +1321,26 @@ impl SlicerState {
             return;
         }
         let Some(audio) = self.audio.as_ref() else { return; };
-        let interleaved = crate::audio::pcm16_le_bytes_to_interleaved_f32(&audio.pcm16_le);
+        let bpf = usize::from(audio.channels.max(1)) * 2;
+        let (b0, b1) = if let Some((s, e)) = self.selection {
+            let total = audio.mono.len();
+            let s = s.min(total);
+            let e = e.min(total);
+            if e > s {
+                (s * bpf, (e * bpf).min(audio.pcm16_le.len()))
+            } else {
+                (0, audio.pcm16_le.len())
+            }
+        } else {
+            (0, audio.pcm16_le.len())
+        };
+        let interleaved = crate::audio::pcm16_le_bytes_to_interleaved_f32(
+            &audio.pcm16_le[b0..b1],
+        );
         match Playback::start_loop(interleaved, audio.sample_rate, audio.channels) {
             Ok(p) => {
                 self.playback = Some(p);
-                self.previewing_slice = None; // Loop full = pas de slice spécifique
+                self.previewing_slice = None;
                 self.playing_remix = false;
             }
             Err(e) => self.error = Some(format!("Playback : {e}")),
@@ -1010,14 +1431,24 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
     }
 
     // Navigation clavier : Space → onset suivant, Shift+Space ou Ctrl+Space
-    // → onset précédent. On ne consomme pas la touche si une TextEdit a le focus.
+    // → onset précédent. Ctrl+Z → undo. Échap → clear selection.
+    // On ne consomme pas les touches si une TextEdit a le focus.
     if !ui.ctx().wants_keyboard_input() && state.audio.is_some() {
-        let (space, back) = ui.input(|i| (
+        let (space, mods, ctrl_z, escape) = ui.input(|i| (
             i.key_pressed(egui::Key::Space),
-            i.modifiers.shift || i.modifiers.ctrl || i.modifiers.command,
+            i.modifiers,
+            (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Z),
+            i.key_pressed(egui::Key::Escape),
         ));
+        let back = mods.shift || mods.ctrl || mods.command;
         if space {
             state.cycle_onset(if back { -1 } else { 1 });
+        }
+        if ctrl_z {
+            state.undo();
+        }
+        if escape {
+            state.clear_selection();
         }
     }
 
@@ -1026,8 +1457,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut SlicerState) {
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(
-            "Drop un WAV ; les transients sont détectés via a3000-onset \
-             (port Rust de librosa.onset_detect).",
+            "Drop un WAV ; les transients sont détectés via a3000-onset. \
+             Alt+drag d'un onset → warp (time-stretch des slices voisines).",
         ).color(palette::FG_DIM),
     );
     ui.separator();
@@ -1109,7 +1540,10 @@ fn show_top_bar(ui: &mut egui::Ui, state: &mut SlicerState) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let has_audio = state.audio.is_some();
             let playing = state.is_playing();
-            let label = if playing { "Stop" } else { "Loop" };
+            let has_sel = state.selection.is_some();
+            // Loop sélection si active, sinon loop full audio.
+            let label = if playing { "Stop" }
+                else if has_sel { "Loop sel" } else { "Loop" };
             let fill = if playing { palette::ACCENT_ORANGE } else { palette::ACCENT_GREEN };
             let btn = egui::Button::new(
                 egui::RichText::new(label).color(egui::Color32::WHITE),
@@ -1147,8 +1581,13 @@ fn show_top_bar(ui: &mut egui::Ui, state: &mut SlicerState) {
 const CELL_H: f32 = 22.0;
 const WAVEFORM_H: f32 = 200.0;
 const ONSET_HIT_PX: f32 = 5.0;
+/// Zone de hit (px) autour des extrémités de la sélection pour amorcer un
+/// drag-resize. Plus large que ONSET_HIT_PX car les extrémités sont moins
+/// précises visuellement (stroke 1.5 px vs marker 2 px).
+const SELECTION_EDGE_HIT_PX: f32 = 6.0;
 const REMIX_STRIP_H: f32 = 26.0;
-const REMIX_CONTROLS_H: f32 = 32.0;
+// 4 lignes empilées : header + Shuffle + Repeat + Stutter, ~28 px chacune.
+const REMIX_CONTROLS_H: f32 = 120.0;
 
 fn show_canvas(ui: &mut egui::Ui, state: &mut SlicerState) {
     let avail_w = ui.available_width().max(100.0);
@@ -1291,28 +1730,79 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
     let has_audio = state.audio.is_some();
     let has_slices = !state.onsets.is_empty();
     let enabled = has_audio && has_slices;
-    // `horizontal_wrapped` autorise le retour à la ligne quand l'espace
-    // horizontal manque (labels "Shuffle/Repeat/Stutter" en entier + autres
-    // contrôles peuvent dépasser la largeur sur fenêtre étroite).
-    ui.horizontal_wrapped(|ui| {
-        ui.add_enabled_ui(enabled, |ui| {
+    ui.add_enabled_ui(enabled, |ui| {
+        let mut changed = false;
+
+        // === Ligne 1 : header (Play + actions globales + Drag MIDI) ===
+        ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Remix").color(palette::FG_DIM).strong());
-            // Play/Stop
             let playing = state.playing_remix;
             let play_label = if playing { "Stop" } else { "Play" };
             let play_fill = if playing { palette::ACCENT_ORANGE } else { palette::ACCENT_GREEN };
             let play_btn = egui::Button::new(
                 egui::RichText::new(play_label).color(egui::Color32::WHITE),
             ).fill(play_fill);
-            if ui.add_sized([60.0, REMIX_CONTROLS_H - 4.0], play_btn).clicked() {
+            if ui.add_sized([60.0, 26.0], play_btn).clicked() {
                 state.toggle_remix_playback();
             }
-            let mut changed = false;
-
-            // === Groupe Shuffle === (label + mode + slider)
             ui.separator();
-            ui.label(egui::RichText::new("Shuffle")
-                .color(palette::ACCENT_GREEN).strong());
+            if ui.button("↻ All").on_hover_text("Re-roll les 3 étages").clicked() {
+                state.shuffle_seed = state.shuffle_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                state.repeat_seed = state.repeat_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                state.stutter_seed = state.stutter_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                changed = true;
+            }
+            if ui.button("Reset")
+                .on_hover_text("Reset intensités + mode → identité")
+                .clicked()
+            {
+                state.reset_remix_params();
+            }
+            ui.separator();
+            #[cfg(windows)]
+            {
+                let drag_resp = drag_remix_midi_button(ui, enabled, 26.0);
+                if drag_resp.drag_started() {
+                    match state.generate_remix_midi_file() {
+                        Ok(p) => match crate::ole_drag::drag_file(&p) {
+                            Ok(eff) if eff.0 != 0 => {
+                                state.error = Some(format!("Remix MIDI déposé ({} steps)", state.remix_sequence.len()));
+                            }
+                            Ok(_) => { state.error = Some("Remix MIDI : drag annulé".into()); }
+                            Err(e) => state.error = Some(format!("× drag remix: {e}")),
+                        },
+                        Err(e) => state.error = Some(format!("× {e}")),
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = ui.add_enabled(enabled, egui::Button::new("Drag MIDI Remix"));
+            }
+        });
+
+        // Layout uniforme par étage : [label fixe] [↻] [params variables].
+        // Le ↻ est placé après le label et AVANT les params, donc il s'aligne
+        // verticalement entre les lignes même si les params diffèrent
+        // (ComboBox sur Shuffle, slider seul sur Repeat/Stutter).
+
+        // === Ligne 2 : Shuffle (label + ↻ + slider + mode) ===
+        // Le slider vient AVANT la ComboBox de mode → les sliders sont
+        // alignés verticalement avec ceux de Repeat / Stutter, la ComboBox
+        // déborde à droite (visible uniquement sur la ligne Shuffle).
+        ui.horizontal(|ui| {
+            ui.add_sized([60.0, 20.0],
+                egui::Label::new(egui::RichText::new("Shuffle")
+                    .color(palette::ACCENT_GREEN).strong()));
+            if ui.button("↻").on_hover_text("Re-roll Shuffle (new seed)").clicked() {
+                state.shuffle_seed = state.shuffle_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                changed = true;
+            }
+            let r = ui.add(
+                egui::Slider::new(&mut state.shuffle_intensity, 0.0..=1.0)
+                    .show_value(true).fixed_decimals(2)
+            );
+            if r.changed() { changed = true; }
             let mode_label = match state.shuffle_mode {
                 ShuffleMode::Random => "Random",
                 ShuffleMode::PairSwap => "Pair-swap",
@@ -1335,83 +1825,56 @@ fn show_remix_controls(ui: &mut egui::Ui, state: &mut SlicerState) {
                         }
                     }
                 });
-            let r1 = ui.add(
-                egui::Slider::new(&mut state.shuffle_intensity, 0.0..=1.0)
-                    .show_value(true).fixed_decimals(2)
-            );
+        });
 
-            // === Groupe Repeat ===
-            ui.separator();
-            ui.label(egui::RichText::new("Repeat")
-                .color(palette::ACCENT_GREEN).strong());
-            let r2 = ui.add(
+        // === Ligne 3 : Repeat (label + ↻ + slider) ===
+        ui.horizontal(|ui| {
+            ui.add_sized([60.0, 20.0],
+                egui::Label::new(egui::RichText::new("Repeat")
+                    .color(palette::ACCENT_GREEN).strong()));
+            if ui.button("↻").on_hover_text("Re-roll Repeat (new seed)").clicked() {
+                state.repeat_seed = state.repeat_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                changed = true;
+            }
+            let r = ui.add(
                 egui::Slider::new(&mut state.repeat_intensity, 0.0..=1.0)
                     .show_value(true).fixed_decimals(2)
             );
+            if r.changed() { changed = true; }
+        });
 
-            // === Groupe Stutter ===
-            ui.separator();
-            ui.label(egui::RichText::new("Stutter")
-                .color(palette::ACCENT_GREEN).strong());
-            let r3 = ui.add(
+        // === Ligne 4 : Stutter (label + ↻ + slider) ===
+        ui.horizontal(|ui| {
+            ui.add_sized([60.0, 20.0],
+                egui::Label::new(egui::RichText::new("Stutter")
+                    .color(palette::ACCENT_GREEN).strong()));
+            if ui.button("↻").on_hover_text("Re-roll Stutter (new seed)").clicked() {
+                state.stutter_seed = state.stutter_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                changed = true;
+            }
+            let r = ui.add(
                 egui::Slider::new(&mut state.stutter_intensity, 0.0..=1.0)
                     .show_value(true).fixed_decimals(2)
             );
-            ui.separator();
-
-            if r1.changed() || r2.changed() || r3.changed() { changed = true; }
-
-            if ui.button("↻").on_hover_text("Regenerate (new seed)").clicked() {
-                state.remix_seed = state.remix_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                changed = true;
-            }
-            // Reset des paramètres : intensités à 0 + mode Random. Préserve
-            // le seed (utiliser ↻ pour le changer).
-            if ui.button("Reset")
-                .on_hover_text("Reset intensités + mode → identité")
-                .clicked()
-            {
-                state.reset_remix_params();
-            }
-            if changed {
-                state.regenerate_remix();
-            }
-
-            // Drag MIDI inline (avant on était en `with_layout(right_to_left)`
-            // pour flush right, mais ça ne fonctionne plus dans un
-            // `horizontal_wrapped`). Reste sur la même ligne que les autres
-            // contrôles, ou wrap si pas la place.
-            #[cfg(windows)]
-            {
-                let drag_resp = drag_remix_midi_button(ui, enabled, REMIX_CONTROLS_H);
-                if drag_resp.drag_started() {
-                    match state.generate_remix_midi_file() {
-                        Ok(p) => match crate::ole_drag::drag_file(&p) {
-                            Ok(eff) if eff.0 != 0 => {
-                                state.error = Some(format!("Remix MIDI déposé ({} steps)", state.remix_sequence.len()));
-                            }
-                            Ok(_) => { state.error = Some("Remix MIDI : drag annulé".into()); }
-                            Err(e) => state.error = Some(format!("× drag remix: {e}")),
-                        },
-                        Err(e) => state.error = Some(format!("× {e}")),
-                    }
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = ui.add_enabled(enabled, egui::Button::new("↓ Drag MIDI Remix"));
-            }
+            if r.changed() { changed = true; }
         });
+
+        if changed {
+            state.regenerate_remix();
+        }
     });
 }
 
 #[cfg(windows)]
 fn drag_remix_midi_button(ui: &mut egui::Ui, enabled: bool, h: f32) -> egui::Response {
+    // Glyph `↓` retiré : pas dans la police default d'egui → rendu en carré
+    // blanc fallback. Aligné sur le pattern du bouton "Drag MIDI" standard
+    // (cf. `drag_midi_button` plus bas) : texte simple + fill BUTTON_MIDI.
     let btn = egui::Button::new(
-        egui::RichText::new("↓ Drag MIDI Remix").color(egui::Color32::WHITE),
+        egui::RichText::new("Drag MIDI Remix").color(egui::Color32::WHITE),
     ).fill(palette::BUTTON_MIDI);
     ui.add_enabled_ui(enabled, |ui| {
-        ui.add_sized([170.0, h], btn).interact(egui::Sense::click_and_drag())
+        ui.add_sized([150.0, h], btn).interact(egui::Sense::click_and_drag())
     }).inner
 }
 
@@ -1638,9 +2101,24 @@ fn handle_waveform_interaction(
             }
         }
     }
-    // Curseur : ↔ sur un onset ou pendant son drag, ✋ (Grab/Grabbing) sinon
-    // sur la zone pannable.
-    if hovered_onset.is_some() || state.dragging_onset.is_some() {
+    // Curseur : ↔ sur un onset OU extrémité de sélection, ✋ sur zone
+    // pannable, default sinon.
+    let edge_hover_for_cursor = state.selection.and_then(|(s, e)| {
+        let p = hover_pos?;
+        if !rect.contains(p) { return None; }
+        if let Some(x_s) = sample_to_x(s) {
+            if (x_s - p.x).abs() < SELECTION_EDGE_HIT_PX { return Some(()); }
+        }
+        if let Some(x_e) = sample_to_x(e) {
+            if (x_e - p.x).abs() < SELECTION_EDGE_HIT_PX { return Some(()); }
+        }
+        None
+    });
+    if hovered_onset.is_some()
+        || state.dragging_onset.is_some()
+        || edge_hover_for_cursor.is_some()
+        || state.selection_drag_edge.is_some()
+    {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
     } else if state.dragging_pan.is_some() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -1648,35 +2126,102 @@ fn handle_waveform_interaction(
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
 
-    // Première frame de press : on capture soit l'onset sous le curseur,
-    // soit on initie un pan-drag si on est sur une zone vide.
+    // Shift / Ctrl / Alt enfoncés ?
+    let (shift_held, ctrl_held, alt_held) = ui.input(|i|
+        (i.modifiers.shift, i.modifiers.ctrl || i.modifiers.command, i.modifiers.alt)
+    );
+
+    // Détecte le hover sur une extrémité de la sélection (pour cursor + drag).
+    // Chaque edge testé indépendamment : si la selection s'étend hors view
+    // (cas zoom in), une extrémité peut être invisible mais l'autre toujours
+    // grabbable. L'ancien code en `?` rejetait tout dès qu'UNE extrémité
+    // était hors view.
+    let edge_hover = state.selection.and_then(|(s, e)| {
+        let p = hover_pos?;
+        if !rect.contains(p) { return None; }
+        if let Some(x_s) = sample_to_x(s) {
+            if (x_s - p.x).abs() < SELECTION_EDGE_HIT_PX {
+                return Some(SelectionEdge::Left);
+            }
+        }
+        if let Some(x_e) = sample_to_x(e) {
+            if (x_e - p.x).abs() < SELECTION_EDGE_HIT_PX {
+                return Some(SelectionEdge::Right);
+            }
+        }
+        None
+    });
+
+    // Première frame de press : ordre de priorité —
+    //   1) Shift+press → nouvelle sélection
+    //   2) Hover sur extrémité de sélection → drag d'edge (resize)
+    //   3) Press sur onset → drag d'onset
+    //   4) Sinon → pan
     if resp.is_pointer_button_down_on()
         && state.dragging_onset.is_none()
         && state.dragging_pan.is_none()
+        && state.selection_drag_start.is_none()
+        && state.selection_drag_edge.is_none()
     {
         if let Some(p) = resp.interact_pointer_pos() {
-            let mut found_onset = None;
-            for (i, &o) in state.onsets.iter().enumerate() {
-                if let Some(ox) = sample_to_x(o) {
-                    if (ox - p.x).abs() < ONSET_HIT_PX {
-                        found_onset = Some(i);
-                        break;
+            if shift_held {
+                let sample = x_to_sample(p.x);
+                state.selection_drag_start = Some(sample);
+                state.selection = Some((sample, sample));
+            } else if let Some(edge) = edge_hover {
+                state.selection_drag_edge = Some(edge);
+            } else {
+                let mut found_onset = None;
+                for (i, &o) in state.onsets.iter().enumerate() {
+                    if let Some(ox) = sample_to_x(o) {
+                        if (ox - p.x).abs() < ONSET_HIT_PX {
+                            found_onset = Some(i);
+                            break;
+                        }
                     }
                 }
-            }
-            if let Some(idx) = found_onset {
-                state.dragging_onset = Some(idx);
-            } else {
-                // Pan : on enregistre la position du curseur ET la view au moment
-                // du press. Ensuite on calcule new_start en fonction du delta.
-                state.dragging_pan = Some((p.x, view.start));
+                if let Some(idx) = found_onset {
+                    state.dragging_onset = Some(idx);
+                    // Alt+drag d'un onset (idx > 0) → init un warp drag :
+                    // snapshot l'audio entre les voisins pour stretch au release.
+                    // Onset 0 ne peut pas être warpé (pas de slice gauche).
+                    if alt_held && idx > 0 {
+                        state.start_warp_drag(idx);
+                    }
+                } else {
+                    state.dragging_pan = Some((p.x, view.start));
+                }
             }
         }
     }
 
     // Mise à jour pendant que la souris bouge.
     if resp.is_pointer_button_down_on() {
-        if let Some(idx) = state.dragging_onset {
+        if let Some(start_sample) = state.selection_drag_start {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let cur = x_to_sample(p.x);
+                let (lo, hi) = if cur < start_sample { (cur, start_sample) }
+                    else { (start_sample, cur) };
+                state.selection = Some((lo, hi));
+            }
+        } else if let Some(edge) = state.selection_drag_edge {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if let Some((s, e)) = state.selection {
+                    let cur = x_to_sample(p.x);
+                    let new_sel = match edge {
+                        SelectionEdge::Left => {
+                            let new_s = cur.min(e.saturating_sub(1));
+                            (new_s, e)
+                        }
+                        SelectionEdge::Right => {
+                            let new_e = cur.max(s + 1);
+                            (s, new_e)
+                        }
+                    };
+                    state.selection = Some(new_sel);
+                }
+            }
+        } else if let Some(idx) = state.dragging_onset {
             if let Some(p) = resp.interact_pointer_pos() {
                 let new_sample = x_to_sample(p.x);
                 let lo = if idx > 0 { state.onsets[idx - 1].saturating_add(1) } else { 0 };
@@ -1689,8 +2234,6 @@ fn handle_waveform_interaction(
         } else if let Some((press_x, press_start)) = state.dragging_pan {
             if let Some(p) = resp.interact_pointer_pos() {
                 let dx = p.x - press_x;
-                // Drag mouse right → contenu sous curseur reste sous curseur →
-                // view.start diminue → delta négatif.
                 let samples_per_px = view.len() as f32 / rect.width().max(1.0);
                 let delta_samples = -(dx * samples_per_px) as i64;
                 let view_len = view.len();
@@ -1706,13 +2249,38 @@ fn handle_waveform_interaction(
         }
     } else {
         // Bouton relâché — fin du drag.
+        if let Some((s, e)) = state.selection {
+            if e <= s + 1 { state.selection = None; }
+        }
+        // Si la sélection a été créée ou redimensionnée pendant qu'on jouait
+        // en loop (pas remix, pas preview), restart la lecture avec le
+        // nouveau buffer pour refléter la sélection courante. On le fait au
+        // RELEASE (pas pendant le drag) pour éviter les clicks audio à
+        // chaque pixel.
+        let did_selection_change = state.selection_drag_start.is_some()
+            || state.selection_drag_edge.is_some();
+        let had_warp = state.warp_drag.is_some();
         state.dragging_onset = None;
         state.dragging_pan = None;
+        state.selection_drag_start = None;
+        state.selection_drag_edge = None;
+        // Commit du time-stretch si on était en Alt+drag d'onset.
+        if had_warp {
+            state.commit_warp_drag();
+        }
+        if did_selection_change
+            && state.playback.is_some()
+            && !state.playing_remix
+            && state.previewing_slice.is_none()
+        {
+            state.restart_loop_with_current_selection();
+        }
     }
 
-    // Click simple sur la waveform (sans drag) hors d'un onset → joue la slice
-    // sous le curseur. resp.clicked() ne fire que si le mouvement est resté
-    // sous le drag-threshold (~6 px), donc pas de conflit avec drag-onset/pan.
+    // Click simple sur la waveform (sans drag) hors d'un onset →
+    //   - Ctrl+click : étend la sélection avec la slice sous le curseur
+    //     (ou la crée si pas de sélection)
+    //   - click normal : joue la slice en preview
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             let was_on_onset = state.onsets.iter().any(|&o| {
@@ -1720,7 +2288,11 @@ fn handle_waveform_interaction(
             });
             if !was_on_onset {
                 let sample = x_to_sample(p.x);
-                state.play_slice_at_sample(sample);
+                if ctrl_held {
+                    state.extend_selection_with_slice_at(sample);
+                } else {
+                    state.play_slice_at_sample(sample);
+                }
             }
         }
     }
@@ -1770,8 +2342,33 @@ fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
         }
     }
 
-    // Onset markers verticaux (uniquement ceux dans la fenêtre visible).
+    // Sélection (Shift+drag) : overlay translucide bleu sur la plage.
     let view = state.view;
+    if let Some((sel_s, sel_e)) = state.selection {
+        if view.len() > 0 && sel_e > sel_s {
+            let x0 = view.sample_to_x(sel_s.max(view.start), rect);
+            let x1 = view.sample_to_x(sel_e.min(view.end), rect)
+                .or_else(|| if sel_e >= view.end { Some(rect.right()) } else { None });
+            if let (Some(x0), Some(x1)) = (x0, x1) {
+                if x1 > x0 {
+                    let sel_rect = egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.top()),
+                        egui::pos2(x1, rect.bottom()),
+                    );
+                    painter.rect_filled(
+                        sel_rect, 0.0,
+                        egui::Color32::from_rgba_premultiplied(80, 140, 220, 60),
+                    );
+                    painter.rect_stroke(
+                        sel_rect, 0.0,
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 180, 240)),
+                    );
+                }
+            }
+        }
+    }
+
+    // Onset markers verticaux (uniquement ceux dans la fenêtre visible).
     if view.len() > 0 {
         for (i, &s) in state.onsets.iter().enumerate() {
             if let Some(x) = view.sample_to_x(s, rect) {
@@ -1792,12 +2389,14 @@ fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
         }
     }
 
-    // Playhead. 3 cas :
+    // Playhead. 4 cas :
     //   - Preview de slice → pas de playhead (la position serait dans le
     //     buffer extrait, pas dans le buffer global). La cellule est highlight.
     //   - Lecture remix → on convertit la position dans le buffer rendu vers
     //     la position dans la WAVEFORM ORIGINALE via `remix_current_play_info`.
     //     La playhead suit donc la slice actuellement jouée.
+    //   - Loop **selection** → la playhead parcourt uniquement la plage
+    //     sélectionnée (mapping `[sel.start, sel.end]` au lieu du buffer global).
     //   - Loop full audio → playhead linéaire dans le buffer.
     if state.previewing_slice.is_none() {
         if let Some(pb) = &state.playback {
@@ -1808,6 +2407,11 @@ fn paint_waveform(ui: &egui::Ui, state: &SlicerState, rect: egui::Rect) {
                         .and_then(|(_, slice_idx, offset)| {
                             state.onsets.get(slice_idx).map(|&s| (s + offset).min(total.saturating_sub(1)))
                         })
+                } else if let Some((s, e)) = state.selection {
+                    let sel_len = e.saturating_sub(s);
+                    if sel_len > 0 {
+                        Some(s + (pb.position_fraction() * sel_len as f32) as usize)
+                    } else { None }
                 } else {
                     Some((pb.position_fraction() * total as f32) as usize)
                 };
@@ -1887,6 +2491,31 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
                     state.slice_by_beats();
                 }
             });
+
+            ui.separator();
+
+            // Stretch mode (Warp) : algo utilisé pour Alt+drag d'onset.
+            ui.add_enabled_ui(has_audio, |ui| {
+                let label = match state.stretch_mode {
+                    StretchMode::Linear => "Linear",
+                    StretchMode::Wsola => "WSOLA",
+                };
+                egui::ComboBox::from_id_source("stretch_mode")
+                    .selected_text(label)
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut state.stretch_mode,
+                            StretchMode::Linear, "Linear");
+                        ui.selectable_value(&mut state.stretch_mode,
+                            StretchMode::Wsola, "WSOLA");
+                    });
+                ui.label(egui::RichText::new("Warp:").color(palette::FG_DIM))
+                    .on_hover_text(
+                        "Algorithme de time-stretch utilisé par Alt+drag d'un onset.\n\
+                         Linear = rapide, pitch change léger.\n\
+                         WSOLA = préserve le pitch, plus lent."
+                    );
+            });
         });
     });
 
@@ -1894,6 +2523,31 @@ fn show_footer(ui: &mut egui::Ui, state: &mut SlicerState) {
 
     // Ligne 2 : tous les boutons d'action.
     ui.horizontal(|ui| {
+        // Undo : restaure le snapshot précédent (delete_marked, redetect,
+        // crop, slice_by_beats, add/delete onset).
+        let can_undo = state.can_undo();
+        if ui.add_enabled_ui(can_undo, |ui| {
+            ui.add_sized([70.0, BTN_H], egui::Button::new("Undo"))
+                .on_hover_text("Ctrl+Z — annule la dernière opération destructive")
+        }).inner.clicked() {
+            state.undo();
+        }
+        // Crop : tronque l'audio à la sélection courante (Shift+drag sur la
+        // waveform pour créer une sélection).
+        let has_sel = state.selection.is_some();
+        if ui.add_enabled_ui(has_audio && has_sel, |ui| {
+            ui.add_sized([70.0, BTN_H], egui::Button::new("Crop"))
+                .on_hover_text("Tronque l'audio à la sélection (Shift+drag pour sélectionner)")
+        }).inner.clicked() {
+            state.crop_to_selection();
+        }
+        // Clear selection : raccourci Echap aussi.
+        if ui.add_enabled_ui(has_sel, |ui| {
+            ui.add_sized([90.0, BTN_H], egui::Button::new("Clear sel"))
+                .on_hover_text("Efface la sélection (raccourci : Échap)")
+        }).inner.clicked() {
+            state.clear_selection();
+        }
         // Slice management (gauche → droite : Reset, Delete, None, Select all).
         if ui.add_enabled_ui(has_audio, |ui| {
             ui.add_sized([100.0, BTN_H], egui::Button::new("Reset"))

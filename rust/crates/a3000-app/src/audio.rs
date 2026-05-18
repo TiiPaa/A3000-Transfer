@@ -245,3 +245,16 @@ pub fn pcm16_le_bytes_to_interleaved_f32(bytes: &[u8]) -> Vec<f32> {
     }
     out
 }
+
+/// Conversion inverse de `pcm16_le_bytes_to_interleaved_f32` : f32
+/// interleaved [-1, 1] → PCM 16-bit LE bytes. Sert au time-stretch (Warp)
+/// pour re-splicer le résultat dans `audio.pcm16_le` qui est la source de
+/// vérité pour la stéréo.
+pub fn interleaved_f32_to_pcm16_le(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for &s in samples {
+        let s16 = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        out.extend_from_slice(&s16.to_le_bytes());
+    }
+    out
+}
