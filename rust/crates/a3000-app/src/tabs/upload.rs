@@ -70,6 +70,11 @@ pub struct UploadItem {
     pub sent_bytes: u64,
     pub total_bytes: u64,
     pub error_msg: Option<String>,
+    /// Chemin du fichier temp local créé pour contourner l'inaccessibilité
+    /// des lecteurs réseau côté worker élevé (cf. `app::stage_for_worker`).
+    /// `Some` uniquement quand le fichier source était sur un lecteur
+    /// distant. Supprimé quand le transfert finit (Done/Error).
+    pub staged_temp: Option<PathBuf>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +108,7 @@ impl UploadItem {
                     checked: false, slot: None, state: UploadItemState::Error,
                     progress: 0.0, sent_bytes: 0, total_bytes: 0,
                     error_msg: Some(format!("{n} canaux non supportés")),
+                    staged_temp: None,
                 } };
                 let format_str = format!(
                     "{}-bit {} {}Hz",
@@ -125,6 +131,7 @@ impl UploadItem {
                     sent_bytes: 0,
                     total_bytes: 0,
                     error_msg: None,
+                    staged_temp: None,
                 }
             }
             Err(e) => Self {
@@ -144,7 +151,17 @@ impl UploadItem {
                 sent_bytes: 0,
                 total_bytes: 0,
                 error_msg: Some(e.to_string()),
+                staged_temp: None,
             },
+        }
+    }
+
+    /// Supprime le fichier temp stagé (s'il existe) et oublie la référence.
+    /// Appelé quand le transfert finit (Done/Error) — le worker a alors
+    /// fini de lire le WAV (load_wave est synchrone en début de transfert).
+    pub fn cleanup_staged(&mut self) {
+        if let Some(p) = self.staged_temp.take() {
+            let _ = std::fs::remove_file(p);
         }
     }
 }

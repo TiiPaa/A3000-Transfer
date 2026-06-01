@@ -7,6 +7,8 @@
 
 use std::sync::mpsc;
 use std::time::Duration;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
@@ -242,6 +244,7 @@ impl A3000App {
                     if let Some(it) = self.upload.items.get_mut(idx) {
                         it.state = UploadItemState::Done;
                         it.progress = 1.0;
+                        it.cleanup_staged();
                     }
                     self.upload.next_slot = self.upload.next_slot.saturating_add(1);
                 }
@@ -258,6 +261,7 @@ impl A3000App {
                     if let Some(it) = self.upload.items.get_mut(idx) {
                         it.state = UploadItemState::Error;
                         it.error_msg = Some(msg);
+                        it.cleanup_staged();
                     }
                     // Continue avec le suivant : on saute juste cet item.
                     self.try_start_next_upload();
@@ -302,6 +306,34 @@ impl A3000App {
             return;
         };
         let slot = self.upload.next_slot;
+
+        // Staging réseau : le worker tourne élevé (UAC) sous un token admin
+        // distinct qui ne voit PAS les lecteurs mappés (Z:\…) ni les
+        // credentials UNC de la session utilisateur. Si le fichier est sur un
+        // lecteur distant, on le copie d'abord en local (%TEMP%) côté GUI
+        // — qui lui a accès au réseau — et on passe le chemin temp au worker.
+        let orig_path = self.upload.items[idx].path.clone();
+        let wave_path = match stage_for_worker(&orig_path, idx) {
+            Ok(p) => {
+                // Si une copie temp a été créée (path différent de l'orig),
+                // on la mémorise pour la supprimer à la fin du transfert.
+                if p != orig_path {
+                    self.upload.items[idx].staged_temp = Some(p.clone());
+                }
+                p.to_string_lossy().to_string()
+            }
+            Err(e) => {
+                let it = &mut self.upload.items[idx];
+                it.state = UploadItemState::Error;
+                it.error_msg = Some(format!("Copie locale (réseau) échouée : {e}"));
+                self.status = format!("× staging réseau : {e}");
+                // Enchaîne sur l'item suivant (celui-ci est marqué Error donc
+                // next_pending() le skippe — pas de boucle infinie).
+                self.try_start_next_upload();
+                return;
+            }
+        };
+
         let item = &mut self.upload.items[idx];
         item.slot = Some(slot);
         item.state = UploadItemState::Running;
@@ -317,7 +349,7 @@ impl A3000App {
             lun: self.config.lun,
             sample_number: slot,
             name: item.sample_name.clone(),
-            wave_path: item.path.to_string_lossy().to_string(),
+            wave_path,
         };
         if let Err(e) = sender.send_cmd(&cmd) {
             self.status = format!("× send Transfer: {e}");
@@ -577,6 +609,28 @@ impl A3000App {
                     );
                 });
 
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.label(egui::RichText::new("Fichiers temporaires").color(palette::ACCENT_YELLOW).strong());
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "L'app crée des fichiers temp dans %TEMP% (staging réseau, \
+                         archives extraites, slices/MIDI du Slicer). Normalement \
+                         nettoyés automatiquement ; force le nettoyage si besoin.",
+                    ).color(palette::FG_DIM).small(),
+                );
+                ui.add_space(4.0);
+                if ui.button("Nettoyer les fichiers temporaires").clicked() {
+                    let (n, bytes) = cleanup_temp_dirs();
+                    self.status = format!(
+                        "Nettoyage : {n} fichier(s) supprimé(s), {:.1} MB libérés",
+                        bytes as f64 / (1024.0 * 1024.0),
+                    );
+                }
+
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -723,4 +777,90 @@ impl eframe::App for A3000App {
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
         let _ = self.config.save();
     }
+}
+
+/// Liste des sous-dossiers de `%TEMP%` créés par l'app, nettoyés par
+/// `cleanup_temp_dirs`. `a3000_downloads` est volontairement EXCLU (c'est
+/// la destination par défaut des samples téléchargés — fichiers à garder).
+const TEMP_SUBDIRS: &[&str] = &[
+    "a3000_staged",            // staging réseau (Upload)
+    "a3000_extracted",         // archives .zip/.tar.gz extraites
+    "a3000_slicer_slices",     // slices WAV exportées
+    "a3000_slicer_midi",       // MIDI Slicer
+    "a3000_slicer_remix_midi", // MIDI Remix
+];
+
+/// Supprime tous les fichiers des sous-dossiers temp de l'app. Retourne
+/// `(nb_fichiers_supprimés, octets_libérés)`. Les fichiers verrouillés
+/// (transfert en cours) sont ignorés silencieusement.
+fn cleanup_temp_dirs() -> (usize, u64) {
+    let base = std::env::temp_dir();
+    let mut n = 0usize;
+    let mut bytes = 0u64;
+    for sub in TEMP_SUBDIRS {
+        let dir = base.join(sub);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue; };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if p.is_dir() {
+                if std::fs::remove_dir_all(&p).is_ok() { n += 1; bytes += size; }
+            } else if std::fs::remove_file(&p).is_ok() {
+                n += 1;
+                bytes += size;
+            }
+        }
+    }
+    (n, bytes)
+}
+
+/// Détecte si `path` est sur un lecteur réseau (mappé `X:\` de type
+/// `DRIVE_REMOTE`, ou chemin UNC `\\serveur\…`). Ces chemins sont
+/// invisibles pour le worker élevé (token admin distinct, sans les drives
+/// mappés / credentials de la session utilisateur).
+#[cfg(windows)]
+fn drive_is_remote(path: &Path) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    // `GetDriveTypeW` renvoie un code u32 ; DRIVE_REMOTE = 4 (valeur stable
+    // de l'API Win32, non exposée comme constante dans windows 0.58).
+    const DRIVE_REMOTE: u32 = 4;
+
+    let s = path.to_string_lossy();
+    // UNC : \\serveur\partage ou //serveur/partage
+    if s.starts_with("\\\\") || s.starts_with("//") {
+        return true;
+    }
+    // Lecteur "X:\…" → interroge GetDriveTypeW sur la racine "X:\".
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= 2 && chars[1] == ':' {
+        let root: Vec<u16> = format!("{}:\\", chars[0])
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let dt = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        return dt == DRIVE_REMOTE;
+    }
+    false
+}
+
+/// Si `path` est sur un lecteur réseau, le copie dans
+/// `%TEMP%\a3000_staged\<idx>_<nom>` (côté GUI, qui a accès au réseau) et
+/// retourne ce chemin local. Sinon retourne le chemin original tel quel.
+/// Le préfixe `idx` évite les collisions de noms dans un batch.
+#[cfg(windows)]
+fn stage_for_worker(path: &Path, idx: usize) -> std::io::Result<PathBuf> {
+    if !drive_is_remote(path) {
+        return Ok(path.to_path_buf());
+    }
+    let dir = std::env::temp_dir().join("a3000_staged");
+    std::fs::create_dir_all(&dir)?;
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "sample.wav".to_string());
+    let dest = dir.join(format!("{idx}_{fname}"));
+    std::fs::copy(path, &dest)?;
+    Ok(dest)
 }
