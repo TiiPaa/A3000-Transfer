@@ -58,9 +58,13 @@ fn main() -> ExitCode {
     // Explorer + propriétés du fichier).
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .ok();
+    // Taille FIXE 1150×720 : `with_resizable(false)` empêche le
+    // redimensionnement (évite le chevauchement des boutons du footer Slicer
+    // sur fenêtre trop étroite). +50 px de large vs l'ancien 1100 pour que
+    // toute la barre d'actions du Slicer tienne confortablement.
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_inner_size([1100.0, 720.0])
-        .with_min_inner_size([700.0, 480.0])
+        .with_inner_size([1150.0, 720.0])
+        .with_resizable(false)
         .with_title("A3000 Transfer");
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
